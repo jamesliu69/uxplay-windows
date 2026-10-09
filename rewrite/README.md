@@ -3,6 +3,14 @@
 Full rewrite of uxplay-windows with zero shared code with the original
 (C++/Qt/libuxplay). License: GPL-3.0-or-later.
 
+## Development history / 開發紀錄
+
+- [開發與問題紀錄索引](../docs/development/README.md)
+- [2026-10-09 完整開發紀錄：播放尺寸、停格、音訊、畫質、FFmpeg 與 MSI 修正](../docs/development/2026-10-09-uxplay-rs-development-history.md)
+
+These records distinguish intermediate results, device confirmation, package
+validation and incomplete installed-application checks.
+
 ## Layout rule: one language, one folder
 
 Each language project lives **entirely in its own top-level folder** and must

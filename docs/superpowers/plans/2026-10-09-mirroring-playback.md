@@ -1,5 +1,10 @@
 # Mirroring playback improvements
 
+Historical checkpoints follow in chronological order; earlier pending/status
+statements describe those checkpoints, not the latest state. See the
+[complete development and issue history](../../development/2026-10-09-uxplay-rs-development-history.md)
+for the consolidated record and the subsequent MSI 0.1.1 OS-check correction.
+
 User-approved design (2026-10-09): select Small, Medium, Large, or Fit to screen
 inside the playback window. Default to Medium. Preserve aspect ratio and the
 selection through phone rotation. Resizing must not reconnect the receiver.
@@ -221,3 +226,31 @@ Administrative extraction did not install/register the product. Actual
 install/uninstall/upgrade and installed GUI/device playback were not run;
 the existing user's live receiver was left running. This is a local unsigned
 installer, not a signed public release. No commit or push was performed.
+
+## Installer 0.1.1: actual Windows build check
+
+The user subsequently reproduced an OS launch-condition failure on 64-bit
+Windows 11 build 26300. Native msiexec reported compatibility WindowsBuild 9600
+and VersionNT64 603. The 0.1.0 condition incorrectly rejected that environment;
+administrative extraction and a PowerShell-hosted COM evaluation had not caught
+the real installation behavior.
+
+The manifest now reads CurrentBuildNumber from the 64-bit HKLM Windows version
+key into secure UXPLAY_WINDOWS_BUILD before LaunchConditions. Seven condition
+fixtures plus native Registry AppSearch passed; independent review confirmed
+AppSearch precedes LaunchConditions in both UI and execute sequences.
+
+Another session committed the accumulated changes as 28b360d during the build.
+The HEAD guard stopped that build's receipt creation. Staging and packaging were
+rerun against 28b360d3fa3b43bd9b97985e0d5e62f9ee2ca313 with a clean source tree.
+Final MSI: rewrite/out/x64/artifacts/UxPlayRs-0.1.1-x64.msi, 109974220 bytes,
+SHA-256 59735d99eb1250d992a308f8afd4caaaea786fa981f4741e85c8058033c70b62,
+NotSigned. ICE, extraction, all 470 payload hashes and four extracted-FFmpeg
+tests passed again.
+
+Native msiexec /i /qn passed LaunchConditions with actual build 26300, then
+failed with Error 1925 / exit 1603 because the non-elevated silent process could
+not obtain administrator rights. Full installation was not completed. The
+0.1.1 wizard was opened from Explorer, but computer-use policy blocked msiexec
+window inspection. Installed GUI, upgrade/uninstall and installed-device
+playback remain unverified; the existing receiver was left running.
