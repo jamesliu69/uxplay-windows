@@ -18,7 +18,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rand.workspace = true
-shairplay = { version = "=0.10.0", features = ["video"] }
+shairplay = { path = "../../third_party/shairplay", features = ["video"] }
 openh264 = "0.9"
 minifb = "0.28"
 cpal = "0.17"

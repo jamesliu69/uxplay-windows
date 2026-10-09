@@ -1,6 +1,7 @@
 //! System audio output for decoded AirPlay PCM.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -81,7 +82,10 @@ impl AudioOutputRuntime {
         );
 
         Self {
-            handler: Arc::new(SystemAudioHandler { ring }),
+            handler: Arc::new(SystemAudioHandler {
+                ring,
+                gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            }),
             _stream: Some(stream),
             sample_rate: Some(sample_rate),
             channels: u8::try_from(channels).ok(),
@@ -104,6 +108,7 @@ impl AudioOutputRuntime {
         Self {
             handler: Arc::new(SystemAudioHandler {
                 ring: Arc::new(Mutex::new(AudioRing::new(1))),
+                gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             }),
             _stream: None,
             sample_rate: None,
@@ -152,11 +157,14 @@ impl AudioRing {
         }
     }
 
-    fn push_samples(&mut self, input: &[f32]) {
+    fn push_samples(&mut self, input: &[f32], gain: f32) {
         if input.len() >= self.max_samples {
             self.samples.clear();
-            self.samples
-                .extend(input[input.len() - self.max_samples..].iter().copied());
+            self.samples.extend(
+                input[input.len() - self.max_samples..]
+                    .iter()
+                    .map(|sample| sample * gain),
+            );
             return;
         }
 
@@ -168,16 +176,22 @@ impl AudioRing {
         if overflow > 0 {
             self.samples.drain(..overflow);
         }
-        self.samples.extend(input.iter().copied());
+        self.samples
+            .extend(input.iter().map(|sample| sample * gain));
     }
 
     fn pop_sample(&mut self) -> f32 {
         self.samples.pop_front().unwrap_or(0.0)
     }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
 }
 
 struct SystemAudioHandler {
     ring: Arc<Mutex<AudioRing>>,
+    gain_bits: Arc<AtomicU32>,
 }
 
 impl AudioHandler for SystemAudioHandler {
@@ -190,7 +204,17 @@ impl AudioHandler for SystemAudioHandler {
         );
         Box::new(SystemAudioSession {
             ring: self.ring.clone(),
+            gain_bits: self.gain_bits.clone(),
         })
+    }
+
+    fn on_volume(&self, volume: f32) {
+        let gain = if volume <= -144.0 {
+            0.0
+        } else {
+            10.0_f32.powf(volume.clamp(-30.0, 0.0) / 20.0)
+        };
+        self.gain_bits.store(gain.to_bits(), Ordering::Release);
     }
 
     fn on_client_connected(&self, addr: &str) {
@@ -208,12 +232,20 @@ impl AudioHandler for SystemAudioHandler {
 
 struct SystemAudioSession {
     ring: Arc<Mutex<AudioRing>>,
+    gain_bits: Arc<AtomicU32>,
 }
 
 impl AudioSession for SystemAudioSession {
     fn audio_process(&mut self, samples: &[f32]) {
+        let gain = f32::from_bits(self.gain_bits.load(Ordering::Acquire));
         if let Ok(mut ring) = self.ring.lock() {
-            ring.push_samples(samples);
+            ring.push_samples(samples, gain);
+        }
+    }
+
+    fn audio_flush(&mut self) {
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.clear();
         }
     }
 }
