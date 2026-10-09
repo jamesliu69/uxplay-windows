@@ -476,3 +476,146 @@ impl RaopServer {
         )
     }
 }
+
+#[cfg(all(test, feature = "video"))]
+mod stream_port_tests {
+    use super::*;
+    use crate::crypto::fairplay::FairPlay;
+    use crate::proto::http::{HttpRequest, HttpResponse};
+    use crate::raop::handlers_ap1::RaopConnection;
+    use crate::{AudioFormat, AudioSession, VideoHandler, VideoPacket, VideoSession};
+
+    struct SilentMedia;
+
+    impl AudioHandler for SilentMedia {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(SilentMedia)
+        }
+    }
+
+    impl AudioSession for SilentMedia {
+        fn audio_process(&mut self, _samples: &[f32]) {}
+    }
+
+    impl VideoHandler for SilentMedia {
+        fn video_init(&self) -> Box<dyn VideoSession> {
+            Box::new(SilentMedia)
+        }
+    }
+
+    impl VideoSession for SilentMedia {
+        fn on_video(&mut self, _packet: VideoPacket) {}
+    }
+
+    fn connection() -> RaopConnection {
+        let server = RaopServer::builder()
+            .port(0)
+            .video_handler(Arc::new(SilentMedia))
+            .build(Arc::new(SilentMedia))
+            .unwrap();
+        let shared = server.shared.clone();
+        RaopConnection {
+            raop_rtp: None,
+            fairplay: FairPlay::new(),
+            pairing: shared.pairing.create_session(),
+            local_addr: vec![127, 0, 0, 1],
+            remote_addr: vec![127, 0, 0, 1],
+            remote_socket: "127.0.0.1:5000".parse().unwrap(),
+            nonce: String::new(),
+            shared,
+            srp_server: None,
+            pair_verify: None,
+            ap2_shared_secret: None,
+            pair_verify_secret: None,
+            is_ap2: true,
+            playout_cmd: None,
+            event_sender: None,
+            ekey: Some([0; 16]),
+            eiv: Some([0; 16]),
+            video_task: None,
+            #[cfg(feature = "hls")]
+            hls_state: crate::raop::hls::HlsState::new(),
+        }
+    }
+
+    fn setup(conn: &mut RaopConnection, stream: plist::Dictionary) -> plist::Dictionary {
+        let setup = plist::Dictionary::from_iter([(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        )]);
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &setup).unwrap();
+        let headers = format!(
+            "SETUP /stream RTSP/1.0\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut request = HttpRequest::new();
+        request.add_data(headers.as_bytes()).unwrap();
+        request.add_data(&body).unwrap();
+        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let body = crate::raop::handlers_ap2::handle_setup(conn, &request, &mut response)
+            .expect("valid stream SETUP");
+        let response: plist::Value = plist::from_bytes(&body).unwrap();
+        response.as_dictionary().unwrap()["streams"]
+            .as_array()
+            .unwrap()[0]
+            .as_dictionary()
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn legacy_audio_setup_advertises_its_live_rtp_control_port() {
+        for compression_type in [2u32, 8] {
+            let mut conn = connection();
+            let stream = plist::Dictionary::from_iter([
+                ("type".to_string(), plist::Value::Integer(96u32.into())),
+                (
+                    "ct".to_string(),
+                    plist::Value::Integer(compression_type.into()),
+                ),
+            ]);
+            let reply = setup(&mut conn, stream);
+            let advertised_port = reply["controlPort"].as_unsigned_integer().unwrap() as u16;
+            let rtp = conn.raop_rtp.as_mut().unwrap();
+            let actual_port = rtp.control_lport;
+            let advertised_is_bound =
+                std::net::UdpSocket::bind(("127.0.0.1", advertised_port)).is_err();
+            rtp.stop();
+            assert_eq!(
+                advertised_port, actual_port,
+                "ct={compression_type} must retain the RTP-owned port"
+            );
+            assert!(
+                advertised_is_bound,
+                "ct={compression_type} must advertise an open control socket"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn other_streams_do_not_advertise_a_nonexistent_udp_control_listener() {
+        for stream_type in [96u32, 103, 110, 130] {
+            let mut conn = connection();
+            let mut stream = plist::Dictionary::from_iter([(
+                "type".to_string(),
+                plist::Value::Integer(stream_type.into()),
+            )]);
+            if matches!(stream_type, 96 | 103) {
+                stream.insert("shk".to_string(), plist::Value::Data(vec![0; 32]));
+            }
+            let reply = setup(&mut conn, stream);
+            if let Some(task) = conn.video_task.take() {
+                task.abort();
+            }
+            let stop = conn.shared.active_audio.lock().unwrap().take();
+            if let Some(stop) = stop {
+                stop();
+            }
+            assert!(
+                !reply.contains_key("controlPort"),
+                "stream type {stream_type} has no UDP control listener"
+            );
+        }
+    }
+}

@@ -246,24 +246,22 @@ pub(crate) fn handle_info(
 
     // Video: advertise a display so the iPhone offers screen mirroring
     #[cfg(feature = "video")]
-    if conn.shared.video_handler.is_some() {
+    if let Some(handler) = &conn.shared.video_handler {
+        let (width, height, max_fps) = handler.display_config();
         let display = plist::Dictionary::from_iter([
             (
                 "widthPixels".to_string(),
-                plist::Value::Integer(config::MIRRORING_WIDTH.into()),
+                plist::Value::Integer(width.into()),
             ),
             (
                 "heightPixels".to_string(),
-                plist::Value::Integer(config::MIRRORING_HEIGHT.into()),
+                plist::Value::Integer(height.into()),
             ),
             (
                 "uuid".to_string(),
                 plist::Value::String(config::MIRRORING_UUID.into()),
             ),
-            (
-                "maxFPS".to_string(),
-                plist::Value::Integer(config::MIRRORING_FPS.into()),
-            ),
+            ("maxFPS".to_string(), plist::Value::Integer(max_fps.into())),
             (
                 "features".to_string(),
                 plist::Value::Integer(config::MIRRORING_FEATURES.into()),
@@ -371,7 +369,17 @@ pub(crate) fn handle_setup(
     );
 
     let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
-        setup_streams(conn, streams)?
+        match setup_streams(conn, streams) {
+            Some(streams) => streams,
+            None => {
+                *response = super::rtsp::new_response(
+                    415,
+                    "Unsupported Media Type",
+                    request.header("CSeq").unwrap_or("0"),
+                );
+                return None;
+            }
+        }
     } else {
         setup_initial(conn, dict)?
     };
@@ -380,7 +388,7 @@ pub(crate) fn handle_setup(
 }
 
 #[cfg(feature = "ap2")]
-/// Stream SETUP (`streams` present): dispatch by stream type, then add the shared control port.
+/// Stream SETUP: preserve only ports owned by the selected stream's listeners.
 fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<plist::Dictionary> {
     // Stream SETUP — type 96 (realtime) or type 103 (buffered) or type 110 (video)
     let stream0 = streams.first()?.as_dictionary()?;
@@ -402,15 +410,6 @@ fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<
             tracing::warn!(stream_type, "Unknown AP2 stream type");
         }
     }
-
-    // Control port (shared across streams)
-    let ctrl_sock = std::net::UdpSocket::bind(bind_addr_for(conn)).ok()?;
-    let ctrl_port = ctrl_sock.local_addr().ok()?.port();
-    drop(ctrl_sock);
-    stream_resp.insert(
-        "controlPort".into(),
-        plist::Value::Integer(ctrl_port.into()),
-    );
 
     let mut resp_dict = plist::Dictionary::new();
     resp_dict.insert(
@@ -629,6 +628,27 @@ fn setup_stream_realtime(
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
 ) -> Option<()> {
+    let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
+    let compression_type = stream0
+        .get("ct")
+        .or_else(|| stream0.get("compressionType"))
+        .and_then(|v| v.as_unsigned_integer())
+        .or_else(|| (shk.len() == 32).then_some(2));
+    let compression_type = match compression_type {
+        Some(codec @ (2 | 8)) => codec,
+        codec => {
+            tracing::warn!(
+                ?codec,
+                "Unsupported or missing realtime audio compression type"
+            );
+            conn.shared
+                .handler
+                .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
+                    format!("unsupported realtime audio compression type: {codec:?}"),
+                )));
+            return None;
+        }
+    };
     let sr = stream0
         .get("sr")
         .and_then(|v| v.as_unsigned_integer())
@@ -636,7 +656,7 @@ fn setup_stream_realtime(
     let spf = stream0
         .get("spf")
         .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(352);
+        .unwrap_or(if compression_type == 8 { 480 } else { 352 });
     let audio_format = stream0
         .get("audioFormat")
         .and_then(|v| v.as_unsigned_integer())
@@ -646,9 +666,15 @@ fn setup_stream_realtime(
         bit_depth: 16,
         channels: 2,
     });
-    let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
-
     if shk.len() == 32 {
+        if compression_type != 2 {
+            conn.shared
+                .handler
+                .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
+                    "ChaCha20 realtime audio supports ALAC compression type 2".into(),
+                )));
+            return None;
+        }
         // AP2 realtime ALAC — ChaCha20-Poly1305 per-packet encryption.
         tracing::info!(
             stream_type = 96,
@@ -692,24 +718,62 @@ fn setup_stream_realtime(
 
         stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     } else {
-        // Legacy ALAC — only available with video feature (UxPlay-style features).
+        // Mirroring uses AAC-ELD (ct=8); audio-only legacy sessions use ALAC
+        // (ct=2). Both have the same RTP/AES transport, but different decoders.
         #[cfg(feature = "video")]
         {
+            let channels = stream0
+                .get("ch")
+                .or_else(|| stream0.get("channels"))
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(2);
+            let (rtpmap, fmtp) = match compression_type {
+                8 => {
+                    if !matches!(sr, 44100 | 48000)
+                        || !matches!(spf, 480 | 512)
+                        || !matches!(channels, 1 | 2)
+                    {
+                        conn.shared.handler.on_error(&ShairplayError::Protocol(
+                            ProtocolError::InvalidRtsp(format!(
+                                "unsupported AAC-ELD format: {sr} Hz, {channels} channels, {spf} samples"
+                            )),
+                        ));
+                        return None;
+                    }
+                    (format!("96 AAC-eld/{sr}/{channels}"), format!("96 {spf}"))
+                }
+                2 => (
+                    "96 AppleLossless".to_string(),
+                    format!(
+                        "96 {spf} 0 {} 40 10 14 {} 255 0 0 {}",
+                        alac_format.bit_depth, alac_format.channels, alac_format.sample_rate
+                    ),
+                ),
+                _ => unreachable!(),
+            };
             tracing::info!(
                 stream_type = 96,
+                compression_type,
                 sample_rate = sr,
-                "Legacy ALAC (AES-CBC via ekey)"
+                samples_per_frame = spf,
+                %rtpmap,
+                "Legacy realtime audio (AES-CBC via ekey)"
             );
 
-            let aes_key = conn.ekey.unwrap_or([0u8; 16]);
-            let aes_iv = conn.eiv.unwrap_or([0u8; 16]);
-            let fmtp = format!("96 {spf} 0 16 40 10 14 2 255 0 0 {sr}");
+            let (Some(aes_key), Some(aes_iv)) = (conn.ekey, conn.eiv) else {
+                conn.shared.handler.on_error(&ShairplayError::Protocol(
+                    ProtocolError::InvalidRtsp(
+                        "legacy realtime audio has no AES session key/IV".into(),
+                    ),
+                ));
+                return None;
+            };
             conn.raop_rtp = RaopRtp::new(
                 conn.shared.handler.clone(),
                 crate::raop::rtp::RtpConfig {
                     remote: conn.remote_socket.ip().to_string(),
                     local_addr: local_ip_from(conn),
-                    rtpmap: "96 AppleLossless".to_string(),
+                    rtpmap,
                     fmtp: Some(fmtp),
                     encryption: Some(crate::raop::rtp::RtpEncryption {
                         key: aes_key,
@@ -727,6 +791,11 @@ fn setup_stream_realtime(
                 let (cport, _tport, dport) = rtp.start(true, control_port, 0).ok()?;
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
                 stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
+            } else {
+                conn.shared.handler.on_error(&ShairplayError::Protocol(
+                    ProtocolError::InvalidRtsp("invalid realtime audio codec parameters".into()),
+                ));
+                return None;
             }
         }
         #[cfg(not(feature = "video"))]

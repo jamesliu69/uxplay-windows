@@ -136,6 +136,10 @@ version = "0.8"
 [dependencies.rsa]
 version = "0.9"
 
+[dependencies.rusty_aac]
+version = "=1.1.0"
+default-features = false
+
 [dependencies.rubato]
 version = "3"
 optional = true

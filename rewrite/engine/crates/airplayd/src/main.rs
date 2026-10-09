@@ -6,7 +6,12 @@
 pub mod audio_output;
 pub mod engine;
 pub mod rpc_server;
+mod video_capture;
+#[cfg(test)]
+mod video_color;
+mod video_decoder;
 pub mod video_window;
+pub mod window_size;
 
 use airplay_ipc::EngineParams;
 

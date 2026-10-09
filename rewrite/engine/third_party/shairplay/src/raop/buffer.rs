@@ -2,10 +2,12 @@
 //!
 //! Incoming RTP packets are queued by sequence number into a fixed-size circular
 //! buffer. Each packet is decrypted (AES-128-CBC) and decoded on arrival — either
-//! ALAC (`a=rtpmap:… AppleLossless`) or raw PCM (`a=rtpmap:… L16/<rate>/<ch>`).
+//! ALAC (`AppleLossless`), mirroring AAC-ELD (`AAC-eld/<rate>/<ch>`) or raw
+//! PCM (`L16/<rate>/<ch>`).
 //! The consumer dequeues packets in order, with silence substitution for missing
 //! packets and optional retransmit requests for gaps.
 
+use crate::codec::aac_eld::{AacEldConfig, AacEldDecoder};
 use crate::codec::alac::{AlacConfig, AlacDecoder};
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use std::borrow::Cow;
@@ -31,6 +33,127 @@ struct AesSession {
     iv: [u8; RAOP_AESIV_LEN],
 }
 
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    fn rtp_packet(sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x80, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn aac_eld_rtp_decodes_real_stereo_audio() {
+        // Independently encoded 440 Hz left / 880 Hz right sine waves, using
+        // FDK-AAC 0.5.0 through fdk-aac 0.8.0, AOT 39, raw transport,
+        // 128000 bps, 44100 Hz, stereo, 480 samples/frame, SBR disabled.
+        // Each fixture access unit has a two-byte big-endian length prefix.
+        let mut fixture =
+            include_bytes!("../codec/fixtures/eld-44100-stereo-480.frames").as_slice();
+        let mut buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480")
+            .expect("mirroring AAC-ELD must be supported");
+        let mut sequence = 0;
+        let mut energy = [0.0; 2];
+        while !fixture.is_empty() {
+            let len = u16::from_be_bytes([fixture[0], fixture[1]]) as usize;
+            let payload = &fixture[2..2 + len];
+            fixture = &fixture[2 + len..];
+            assert_eq!(buffer.queue(&rtp_packet(sequence, payload), true), 1);
+            let pcm = buffer.dequeue(true).expect("decoded ELD frame");
+            assert_eq!(pcm.len(), 480 * 2);
+            assert!(pcm.iter().all(|sample| sample.is_finite()));
+            for frame in pcm.as_chunks::<2>().0 {
+                energy[0] += frame[0] * frame[0];
+                energy[1] += frame[1] * frame[1];
+            }
+            sequence += 1;
+        }
+        assert_eq!(sequence, 12);
+        assert!(energy[0] > 100.0, "fixture must exercise non-silent decode");
+        assert!(
+            energy[0] > energy[1] * 3.0,
+            "left/right amplitude must be preserved"
+        );
+        let format = buffer.format();
+        assert_eq!(format.num_channels, 2);
+        assert_eq!(format.sample_rate, 44100);
+    }
+
+    #[test]
+    fn aac_eld_decrypts_aes_blocks_and_keeps_clear_tail() {
+        use aes::cipher::BlockModeEncrypt;
+        let fixture = include_bytes!("../codec/fixtures/eld-44100-stereo-480.frames");
+        let len = u16::from_be_bytes([fixture[0], fixture[1]]) as usize;
+        let raw = &fixture[2..2 + len];
+        assert!(
+            !len.is_multiple_of(16),
+            "fixture must exercise the clear tail"
+        );
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut encrypted = raw.to_vec();
+        let blocks = len / 16 * 16;
+        cbc::Encryptor::<aes::Aes128>::new((&key).into(), (&iv).into())
+            .encrypt_padded::<aes::cipher::block_padding::NoPadding>(
+                &mut encrypted[..blocks],
+                blocks,
+            )
+            .unwrap();
+        let mut encrypted_buffer =
+            RaopBuffer::new("96 AAC-eld/44100/2", "96 480", &key, &iv).unwrap();
+        let mut plain_buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480").unwrap();
+        assert_eq!(encrypted_buffer.queue(&rtp_packet(1, &encrypted), true), 1);
+        assert_eq!(plain_buffer.queue(&rtp_packet(1, raw), true), 1);
+        assert_eq!(encrypted_buffer.dequeue(true), plain_buffer.dequeue(true));
+    }
+
+    #[test]
+    fn aac_eld_rejects_unsupported_parameters_and_bad_packets() {
+        for (rtpmap, fmtp) in [
+            ("96 AAC-eld/44100/2", "96 352"),
+            ("96 AAC-eld/44100/6", "96 480"),
+            ("96 AAC-eld/32000/2", "96 480"),
+            ("96 AAC-eld/44100/2/extra", "96 480"),
+        ] {
+            assert!(RaopBuffer::new_unencrypted(rtpmap, fmtp).is_none());
+        }
+        let mut buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480").unwrap();
+        assert_eq!(buffer.queue(&rtp_packet(1, &[]), true), -1);
+        assert!(buffer.dequeue(true).is_none());
+    }
+
+    #[test]
+    fn alac_rtp_preserves_16_and_24_bit_samples() {
+        for (depth, values, scale) in [
+            (16, [0x4000, 0xc000, 0x2000, 0xe000], 32768.0),
+            (24, [0x400000, 0xc00000, 0x200000, 0xe00000], 8388608.0),
+        ] {
+            let mut fields = vec![(1u32, 3), (0, 4), (0, 12), (0, 1), (0, 2), (1, 1)];
+            fields.extend(values.iter().map(|&value| (value, depth)));
+            let mut payload = Vec::new();
+            let mut position = 0;
+            for (value, width) in fields {
+                for shift in (0..width).rev() {
+                    if position % 8 == 0 {
+                        payload.push(0);
+                    }
+                    let last = payload.last_mut().unwrap();
+                    *last |= (((value >> shift) & 1) as u8) << (7 - position % 8);
+                    position += 1;
+                }
+            }
+            let fmtp = format!("96 2 0 {depth} 40 10 14 2 255 0 0 48000");
+            let mut buffer = RaopBuffer::new_unencrypted("96 AppleLossless", &fmtp).unwrap();
+            assert_eq!(buffer.queue(&rtp_packet(1, &payload), true), 1);
+            let pcm = buffer.dequeue(true).unwrap();
+            assert_eq!(pcm, [0.5, -0.5, 0.25, -0.25]);
+            assert_eq!(scale * pcm[0], values[0] as f32);
+        }
+    }
+}
+
 /// Raw-PCM (`L16`) stream configuration, parsed from the SDP `rtpmap` attribute.
 #[derive(Debug, Clone)]
 pub(crate) struct PcmConfig {
@@ -52,6 +175,11 @@ pub(crate) struct StreamFormat {
 
 /// The negotiated wire codec plus its decoder state.
 enum Codec {
+    /// Enhanced Low Delay AAC, used with AirPlay screen mirroring.
+    AacEld {
+        config: AacEldConfig,
+        decoder: Box<AacEldDecoder>,
+    },
     /// Apple Lossless — the classic AirPlay codec. Also covers PipeWire's
     /// `raop.audio.codec=PCM`, which is really uncompressed-ALAC on the wire.
     Alac {
@@ -66,6 +194,7 @@ enum Codec {
 enum CodecConfig {
     Alac,
     Pcm(PcmConfig),
+    AacEld(PcmConfig),
 }
 
 /// A single slot in the circular buffer holding one decoded audio frame.
@@ -162,6 +291,18 @@ fn parse_codec(rtpmap: &str) -> Option<CodecConfig> {
     let name = encoding.split('/').next()?;
     if name.eq_ignore_ascii_case("AppleLossless") {
         Some(CodecConfig::Alac)
+    } else if name.eq_ignore_ascii_case("AAC-eld") {
+        let mut fields = encoding.split('/');
+        fields.next()?;
+        let sample_rate = fields.next()?.parse().ok()?;
+        let num_channels = fields.next()?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some(CodecConfig::AacEld(PcmConfig {
+            num_channels,
+            sample_rate,
+        }))
     } else {
         parse_l16(encoding).map(CodecConfig::Pcm)
     }
@@ -194,7 +335,7 @@ fn build_decoder_info(config: &AlacConfig) -> [u8; 48] {
 /// # Audio pipeline
 ///
 /// ```text
-/// RTP packet → AES-128-CBC decrypt → ALAC or L16 decode → f32 → buffer slot
+/// RTP packet → AES-128-CBC decrypt → ALAC/AAC-ELD/L16 decode → f32 → buffer slot
 /// ```
 pub struct RaopBuffer {
     aes: Option<AesSession>,
@@ -215,8 +356,8 @@ pub struct RaopBuffer {
 impl RaopBuffer {
     /// Create a new encrypted buffer from SDP parameters and AES session keys.
     ///
-    /// `rtpmap` selects the codec (`AppleLossless` → ALAC, `L16/...` → PCM);
-    /// `fmtp` supplies the ALAC config (ignored for PCM). The decoder is
+    /// `rtpmap` selects ALAC, AAC-ELD or PCM. `fmtp` supplies the ALAC config
+    /// or `"<payload-type> <frame-length>"` for AAC-ELD (ignored for PCM). The decoder is
     /// initialized immediately.
     ///
     /// Returns `None` if the (peer-supplied) `rtpmap`/`fmtp` attributes are
@@ -244,6 +385,26 @@ impl RaopBuffer {
 
     fn build(rtpmap: &str, fmtp: &str, aes: Option<AesSession>) -> Option<Self> {
         let (codec, frame_capacity, silence_samples) = match parse_codec(rtpmap)? {
+            CodecConfig::AacEld(format) => {
+                let mut fields = fmtp.split_whitespace();
+                fields.next()?.parse::<u8>().ok()?;
+                let frame_length = fields.next()?.parse().ok()?;
+                if fields.next().is_some() {
+                    return None;
+                }
+                let config = AacEldConfig {
+                    sample_rate: format.sample_rate,
+                    num_channels: format.num_channels,
+                    frame_length,
+                };
+                let decoder = Box::new(AacEldDecoder::new(config.clone())?);
+                let frame_samples = config.frame_length * usize::from(config.num_channels);
+                (
+                    Codec::AacEld { config, decoder },
+                    frame_samples,
+                    frame_samples,
+                )
+            }
             CodecConfig::Pcm(config) => {
                 // PCM frames are variable-length: size each slot to the largest RTP
                 // payload (worst case) so a big packet never overflows the slot.
@@ -294,6 +455,10 @@ impl RaopBuffer {
     /// Returns the output stream format (channels + source sample rate).
     pub(crate) fn format(&self) -> StreamFormat {
         match &self.codec {
+            Codec::AacEld { config, .. } => StreamFormat {
+                num_channels: config.num_channels,
+                sample_rate: config.sample_rate,
+            },
             Codec::Alac { config, .. } => StreamFormat {
                 num_channels: config.num_channels,
                 sample_rate: config.sample_rate,
@@ -305,7 +470,7 @@ impl RaopBuffer {
         }
     }
 
-    /// Queue an RTP packet: decrypt, decode (ALAC or L16), store f32 in buffer.
+    /// Queue an RTP packet: decrypt, decode the negotiated codec, store f32.
     ///
     /// Returns 1 on success, 0 if duplicate/stale, -1 if packet is malformed.
     /// If the sequence number is far ahead of the current window, the buffer is
@@ -367,28 +532,21 @@ impl RaopBuffer {
         // Decode into the slot's f32 buffer.
         let capacity = self.frame_capacity;
         let num_samples = match &mut self.codec {
+            Codec::AacEld { decoder, .. } => {
+                let Some(samples) = decoder.decode(&packet_buf) else {
+                    return -1;
+                };
+                let count = samples.len();
+                self.entries[idx].audio_buffer[..count].copy_from_slice(&samples);
+                count
+            }
             Codec::Alac { decoder, .. } => {
-                // ALAC decode → S16LE, then convert to f32 samples.
-                let mut s16_buf = vec![0u8; capacity * 2];
-                let output_size = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decoder.decode_frame(&packet_buf, &mut s16_buf)
-                }))
-                .unwrap_or(0);
-                if output_size == 0 {
+                // The decoder handles both negotiated 16-bit and 24-bit ALAC.
+                let Some(samples) = decoder.decode_frame_f32(&packet_buf) else {
                     return 0;
-                }
-                let limit = output_size.min(s16_buf.len());
-                let out = &mut self.entries[idx].audio_buffer;
-                let mut n = 0;
-                for (chunk, out_sample) in s16_buf[..limit]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(out.iter_mut())
-                {
-                    *out_sample = i16::from_le_bytes(*chunk) as f32 / 32768.0;
-                    n += 1;
-                }
+                };
+                let n = samples.len().min(capacity);
+                self.entries[idx].audio_buffer[..n].copy_from_slice(&samples[..n]);
                 n
             }
             Codec::Pcm { config } => {

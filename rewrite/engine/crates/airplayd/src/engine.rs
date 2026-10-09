@@ -44,6 +44,7 @@ impl EngineHandle {
             return Ok(());
         }
 
+        let display = parse_display_config(&self.params)?;
         let mut builder = RaopServer::builder()
             .name(self.params.name.clone())
             .hwaddr(self.persistent_state.mac())
@@ -54,7 +55,7 @@ impl EngineHandle {
             builder = builder.video_handler(discard_video_handler());
             None
         } else {
-            let runtime = VideoWindowRuntime::start();
+            let runtime = VideoWindowRuntime::start(display);
             builder = builder.video_handler(runtime.handler());
             Some(runtime)
         };
@@ -64,7 +65,7 @@ impl EngineHandle {
             builder = builder.output_sample_rate(sample_rate);
         }
         if let Some(channels) = audio_output.channels() {
-            builder = builder.output_max_channels(channels);
+            builder = builder.output_max_channels(channels.min(2));
         }
 
         let mut server = builder
@@ -111,6 +112,24 @@ impl EngineHandle {
         self.state = EngineState::Idle;
         self.detail.clear();
     }
+}
+
+fn parse_display_config(params: &EngineParams) -> Result<(u32, u32, u32)> {
+    let (width, height) = params
+        .resolution
+        .split_once('x')
+        .context("resolution must be WIDTHxHEIGHT")?;
+    let width: u32 = width.parse().context("invalid display width")?;
+    let height: u32 = height.parse().context("invalid display height")?;
+    anyhow::ensure!(
+        (1..=4096).contains(&width) && (1..=4096).contains(&height),
+        "display dimensions must be between 1 and 4096"
+    );
+    anyhow::ensure!(
+        (1..=60).contains(&params.max_fps),
+        "FPS must be between 1 and 60"
+    );
+    Ok((width, height, params.max_fps))
 }
 
 struct ReceiverRuntime {

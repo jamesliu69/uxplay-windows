@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Id="UxPlayRs"
+           Name="UxPlayRs"
+           Manufacturer="UxPlayRs Project"
+           Version="$(ProductVersion)"
+           UpgradeCode="5fc2f5e9-2f63-4bc3-b852-84d3ea403fdd"
+           Language="1028"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of UxPlayRs is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <!-- MSI's compatibility WindowsBuild can report 9600 on Windows 10/11. -->
+    <Property Id="UXPLAY_WINDOWS_BUILD" Secure="yes">
+      <RegistrySearch Id="ActualWindowsBuild" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
+    </Property>
+    <Launch Condition="Installed OR (VersionNT64 AND UXPLAY_WINDOWS_BUILD &gt;= 17763)"
+            Message="UxPlayRs 需要 64 位元 Windows 10（1809）或更新版本。" />
+    <Icon Id="UxPlayRs.ico" SourceFile="$(AppIcon)" />
+    <Property Id="ARPPRODUCTICON" Value="UxPlayRs.ico" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLDIR" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLDIR" Name="UxPlayRs" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuDir" Name="UxPlayRs" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="MainFeature" Title="UxPlayRs" Level="1">
+      <ComponentGroupRef Id="RuntimeFiles" />
+      <ComponentRef Id="GuiComponent" />
+      <ComponentRef Id="MenuFolderComponent" />
+    </Feature>
+    <ComponentGroup Id="RuntimeFiles" Directory="INSTALLDIR">
+      <Files Include="$(BundleDir)\**">
+        <Exclude Files="$(BundleDir)\UxPlayRs.Gui.exe;$(BundleDir)\*.pdb;$(BundleDir)\**\*.pdb" />
+      </Files>
+    </ComponentGroup>
+    <Component Id="GuiComponent" Directory="INSTALLDIR" Guid="*">
+      <File Id="GuiExe" Source="$(BundleDir)\UxPlayRs.Gui.exe" KeyPath="yes">
+        <Shortcut Id="StartMenuShortcut" Directory="AppMenuDir"
+                  Name="UxPlayRs" WorkingDirectory="INSTALLDIR"
+                  Icon="UxPlayRs.ico" Advertise="yes" />
+        <Shortcut Id="DesktopShortcut" Directory="DesktopFolder"
+                  Name="UxPlayRs" WorkingDirectory="INSTALLDIR"
+                  Icon="UxPlayRs.ico" Advertise="yes" />
+      </File>
+    </Component>
+    <Component Id="MenuFolderComponent" Directory="INSTALLDIR" Guid="*">
+      <RemoveFolder Id="RemoveMenuFolder" Directory="AppMenuDir" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\UxPlayRs"
+                     Name="InstallDirectory" Type="string"
+                     Value="[INSTALLDIR]" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

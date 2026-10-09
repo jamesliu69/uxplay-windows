@@ -4,6 +4,7 @@
 //! classifies packets, decrypts Payload types, and delivers to VideoSession.
 
 use bytes::BytesMut;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, trace, warn};
@@ -74,6 +75,10 @@ async fn process(
     mut session: Box<dyn VideoSession>,
 ) {
     let mut header = [0u8; VIDEO_HEADER_LEN];
+    let mut report_at = Instant::now();
+    let mut previous_at = Instant::now();
+    let (mut packets, mut bytes, mut max_gap_ms, mut max_deliver_ms) = (0u64, 0usize, 0u128, 0u128);
+    let mut types = std::collections::BTreeMap::<u16, u64>::new();
 
     loop {
         if !read_exact(&mut stream, &mut header, "header").await {
@@ -96,6 +101,11 @@ async fn process(
             break;
         }
         let kind = classify_packet(metadata.packet_type, &payload);
+        packets += 1;
+        bytes += metadata.payload_len;
+        *types.entry(metadata.packet_type).or_default() += 1;
+        max_gap_ms = max_gap_ms.max(previous_at.elapsed().as_millis());
+        previous_at = Instant::now();
         if matches!(kind, PacketKind::Payload) {
             cipher.decrypt(&mut payload);
         }
@@ -106,11 +116,28 @@ async fn process(
             payload_len = metadata.payload_len,
             "Video packet"
         );
-        session.on_video(VideoPacket {
-            kind,
-            timestamp: metadata.timestamp,
-            payload: payload.freeze(),
-        });
+        let deliver_at = Instant::now();
+        session
+            .on_video_async(VideoPacket {
+                kind,
+                timestamp: metadata.timestamp,
+                payload: payload.freeze(),
+            })
+            .await;
+        max_deliver_ms = max_deliver_ms.max(deliver_at.elapsed().as_millis());
+        if report_at.elapsed() >= Duration::from_secs(5) {
+            info!(
+                packets,
+                mbps = bytes as f64 * 8.0 / report_at.elapsed().as_secs_f64() / 1_000_000.0,
+                max_gap_ms,
+                max_deliver_ms,
+                ?types,
+                "Mirror transport statistics"
+            );
+            report_at = Instant::now();
+            (packets, bytes, max_gap_ms, max_deliver_ms) = (0, 0, 0, 0);
+            types.clear();
+        }
     }
     session.on_video_end();
 }

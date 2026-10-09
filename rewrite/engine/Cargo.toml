@@ -19,5 +19,9 @@ rand = "0.8"
 
 airplay-ipc = { path = "crates/airplay-ipc" }
 
+[patch.crates-io]
+# Backport upstream B-slice prediction fix; see third_party/README.md.
+openh264-sys2 = { path = "third_party/openh264-sys2" }
+
 [profile.release]
 lto = "thin"
