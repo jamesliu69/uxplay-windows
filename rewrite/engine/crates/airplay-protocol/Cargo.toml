@@ -1,0 +1,16 @@
+[package]
+name = "airplay-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RTSP/HTTP message parsing and AirPlay session types"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+hex.workspace = true
+plist = "1"

@@ -1,0 +1,13 @@
+[package]
+name = "airplay-mdns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mDNS advertisement for the AirPlay receiver (_airplay._tcp / _raop._tcp)"
+
+[dependencies]
+mdns-sd.workspace = true
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

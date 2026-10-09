@@ -1,0 +1,22 @@
+[package]
+name = "airplay-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pair-verify (Ed25519/X25519), SRP-6a, stream keys and payload decryption"
+
+[dependencies]
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
+hmac.workspace = true
+aes.workspace = true
+ctr.workspace = true
+chacha20.workspace = true
+rand.workspace = true
+hex.workspace = true
+num-bigint.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true

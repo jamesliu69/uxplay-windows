@@ -1,0 +1,13 @@
+[package]
+name = "airplay-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NDJSON JSON-RPC control plane over a Windows named pipe"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

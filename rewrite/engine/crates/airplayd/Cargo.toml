@@ -1,0 +1,23 @@
+[package]
+name = "airplayd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AirPlay 2 receiver engine daemon (Rust rewrite of libuxplay)"
+
+[[bin]]
+name = "airplayd"
+path = "src/main.rs"
+
+[dependencies]
+airplay-mdns.workspace = true
+airplay-protocol.workspace = true
+airplay-crypto.workspace = true
+airplay-video.workspace = true
+airplay-audio.workspace = true
+airplay-ipc.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

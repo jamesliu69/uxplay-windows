@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="UxPlayRs.Gui.Tests/UxPlayRs.Gui.Tests.csproj" />
+  <Project Path="UxPlayRs.Gui/UxPlayRs.Gui.csproj" />
+</Solution>

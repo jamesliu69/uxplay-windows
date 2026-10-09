@@ -1,0 +1,70 @@
+<Window x:Class="UxPlayRs.Gui.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="UxPlayRs" Height="560" Width="420" MinWidth="380" MinHeight="480">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Padding="10" CornerRadius="6" Background="#F0F4F8" Margin="0,0,0,10">
+            <StackPanel>
+                <TextBlock Text="Status" FontWeight="Bold"/>
+                <TextBlock x:Name="StatusText" Text="Stopped" FontSize="16" Margin="0,2,0,0"/>
+                <TextBlock x:Name="DetailText" Text="" Foreground="Gray" TextWrapping="Wrap"/>
+            </StackPanel>
+        </Border>
+
+        <Grid Grid.Row="1" Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Label Grid.Row="0" Grid.Column="0" Content="Device name:" VerticalAlignment="Center"/>
+            <TextBox Grid.Row="0" Grid.Column="1" x:Name="DeviceNameBox" Margin="4" Text="uxplay-rs"/>
+            <Label Grid.Row="1" Grid.Column="0" Content="Resolution:" VerticalAlignment="Center"/>
+            <ComboBox Grid.Row="1" Grid.Column="1" x:Name="ResolutionCombo" Margin="4">
+                <ComboBoxItem Content="Auto (engine default)" Tag="1920x1080"/>
+                <ComboBoxItem Content="1080p (1920x1080)" Tag="1920x1080"/>
+                <ComboBoxItem Content="720p (1280x720)" Tag="1280x720"/>
+                <ComboBoxItem Content="480p (640x480)" Tag="640x480"/>
+            </ComboBox>
+            <Label Grid.Row="2" Grid.Column="0" Content="Max FPS:" VerticalAlignment="Center"/>
+            <ComboBox Grid.Row="2" Grid.Column="1" x:Name="FpsCombo" Margin="4">
+                <ComboBoxItem Content="30" Tag="30"/>
+                <ComboBoxItem Content="60" Tag="60"/>
+            </ComboBox>
+        </Grid>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,6">
+            <CheckBox x:Name="AudioOnlyCheck" Content="Audio only" VerticalAlignment="Center" Margin="0,0,16,0"/>
+            <CheckBox x:Name="AutostartCheck" Content="Run at login" VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,6">
+            <Button x:Name="StartButton" Content="Start" Width="90" Margin="0,0,8,0" Click="OnStartClicked"/>
+            <Button x:Name="StopButton" Content="Stop" Width="90" Margin="0,0,8,0" Click="OnStopClicked"/>
+            <Button x:Name="SaveLogButton" Content="Save log" Width="90" Click="OnSaveLogClicked"/>
+        </StackPanel>
+
+        <TextBlock Grid.Row="4" Text="Log" FontWeight="Bold" Margin="0,4,0,2"/>
+        <ListBox Grid.Row="5" x:Name="LogList" FontFamily="Consolas" FontSize="11"/>
+
+        <StatusBar Grid.Row="6">
+            <StatusBarItem>
+                <TextBlock x:Name="PipeText" Text="not connected"/>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

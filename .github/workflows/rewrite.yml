@@ -1,0 +1,113 @@
+name: rewrite (Rust engine + WPF GUI)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - rewrite/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - rewrite/**
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: engine (cargo test + build)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: set up Rust
+        uses: actions-rust-lang/rustup@v1
+        with:
+          toolchain: stable
+
+      - name: test engine workspace
+        shell: powershell
+        run: cargo test --workspace --manifest-path rewrite/engine/Cargo.toml
+
+      - name: build airplayd
+        shell: powershell
+        run: cargo build --release -p airplayd --manifest-path rewrite/engine/Cargo.toml
+
+  gui:
+    name: gui (dotnet build + test)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+    steps:
+      - name: check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: build GUI
+        shell: powershell
+        run: dotnet build rewrite/gui/UxPlayRs.slnx -c Release
+
+      - name: test GUI
+        shell: powershell
+        run: dotnet test rewrite/gui/UxPlayRs.slnx -c Release --no-build
+
+  package:
+    name: stage and zip x64 bundle
+    runs-on: windows-latest
+    needs: [engine, gui]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: read
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+    steps:
+      - name: check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: set up Rust
+        uses: actions-rust-lang/rustup@v1
+        with:
+          toolchain: stable
+
+      - name: set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: stage bundle
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File rewrite/packaging/stage.ps1 -Architecture x64
+
+      - name: zip bundle
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File rewrite/packaging/zip.ps1 -Architecture x64
+
+      - name: upload x64 bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: uxplay-rs-x64
+          path: rewrite/out/x64/artifacts/*
+          if-no-files-found: error
