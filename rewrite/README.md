@@ -28,5 +28,9 @@ Rules:
 
 ## Status
 
-See `../.copilot` session plan (or ask the agent). Milestones: engine crates
-→ IPC → GUI → packaging → engine wiring → A/V tuning → iPhone e2e.
+`airplayd` now runs a real AirPlay receiver: mDNS discovery, AirPlay 2
+pairing/FairPlay, RTSP control, screen-mirroring transport, H.264 decode, and a
+native render window are wired end to end. The WPF GUI controls the receiver
+over the named pipe and configures the required Private-network firewall rule
+on first Start. A physical iPhone remains the final device-side integration
+check because it cannot be automated by the Windows test suite.

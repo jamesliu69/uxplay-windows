@@ -19,6 +19,9 @@ Rules:
 - The GUI auto-launches `airplayd.exe` sitting next to it. Do not rename
   either exe, do not use single-file publish, and do not move `airplayd.exe`
   into a subfolder.
+- On the first Start, Windows may show a UAC prompt so the GUI can add the
+  `UxPlayRs AirPlay Receiver` inbound rule for Private networks. The rule is
+  scoped to the bundled `airplayd.exe` path and is reused on later starts.
 - Publish is self-contained (`win-x64` / `win-arm64`) so the bundle installs
   with zero extra dependencies (no .NET runtime install required).
 - BLE beacon note: this bundle stages only the GUI + engine. Any BLE

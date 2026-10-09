@@ -11,16 +11,15 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// Shared engine state cell (single source of truth surfaced via `status`).
-#[derive(Debug)]
 pub struct Engine {
     pub handle: Mutex<EngineHandle>,
 }
 
 impl Engine {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            handle: Mutex::new(EngineHandle::default()),
-        })
+    pub fn new() -> anyhow::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            handle: Mutex::new(EngineHandle::new()?),
+        }))
     }
 }
 
@@ -54,6 +53,11 @@ pub async fn serve(engine: Arc<Engine>, pipe_name: Option<String>) -> anyhow::Re
                 airplay_ipc::pipe::pump_writer(write_half, rx_out).await;
                 let _ = tx_done.send(());
             });
+            // The dispatch task owns the last producer for this client. Once
+            // its reader reaches EOF, dropping that sender closes `rx_out`,
+            // lets the writer finish, and allows this loop to accept a new
+            // named-pipe connection.
+            drop(tx_out);
 
             let _ = rx_done.await;
             warn!("control plane client disconnected; awaiting next client");
@@ -119,20 +123,23 @@ pub mod ipc_dispatch {
                 if let Some(p) = params {
                     e.params = p;
                 }
-                // TODO(milestones): start mDNS advertiser + RTSP listener here.
-                e.running = true;
-                e.state = airplay_ipc::EngineState::Advertising;
-                e.detail = String::new();
+                if let Err(error) = e.start().await {
+                    e.running = false;
+                    e.state = airplay_ipc::EngineState::Error;
+                    e.detail = error.to_string();
+                }
                 vec![respond(id, status_of(&e))]
             }
             "stop" => {
-                // TODO(milestones): tear down advertiser/listener/pipelines.
-                e.running = false;
-                e.state = airplay_ipc::EngineState::Idle;
-                e.detail = String::new();
+                e.stop().await;
                 vec![respond(id, status_of(&e))]
             }
             "set_params" => match params {
+                Some(_) if e.running => vec![RpcResponse::err(
+                    id,
+                    -32001,
+                    "stop the receiver before changing parameters",
+                )],
                 Some(p) => {
                     e.params = p;
                     vec![respond(id, status_of(&e))]
@@ -171,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_status_and_start_stop() {
-        let engine = Engine::new();
+        let engine = Engine::new().unwrap();
         let line = r#"{"jsonrpc":"2.0","id":1,"method":"status"}"#;
         let resp = ipc_dispatch::dispatch(&engine, line).await.pop().unwrap();
         assert!(resp.error.is_none());
@@ -195,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_method_and_bad_json() {
-        let engine = Engine::new();
+        let engine = Engine::new().unwrap();
         let resp = ipc_dispatch::dispatch(&engine, r#"{"jsonrpc":"2.0","id":9,"method":"nope"}"#)
             .await
             .pop()

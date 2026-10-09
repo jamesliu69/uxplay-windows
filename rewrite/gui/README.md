@@ -10,7 +10,8 @@ JSON-RPC 2.0 (`\\.\pipe\uxplay-rs-airplayd`).
   (device name / resolution / FPS / audio-only / run-at-login), log viewer,
   settings persistence (`%APPDATA%\uxplay-rs\settings.json`), engine process
   management (finds `airplayd.exe` next to the GUI, else the dev-built engine
-  under `../engine/target/{release,debug}`).
+  under `../engine/target/{release,debug}`), and a first-run Windows Defender
+  Firewall rule for `airplayd.exe` on Private networks.
 - `UxPlayRs.Gui.Tests` — xUnit tests: IPC round-trip over TCP loopback,
   camelCase contract checks, settings save/load, log ring buffer.
 

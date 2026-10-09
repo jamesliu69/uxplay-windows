@@ -21,6 +21,12 @@ public partial class App : WpfApplication
 
     protected override void OnStartup(WpfStartupEventArgs e)
     {
+        if (FirewallHelper.TryHandleConfigurationMode(e.Args, out var firewallExitCode))
+        {
+            Shutdown(firewallExitCode);
+            return;
+        }
+
         _instanceMutex = new Mutex(initiallyOwned: true, name: @"Global\UxPlayRs-Gui-SingleInstance", out var created);
         if (!created)
         {
@@ -49,6 +55,13 @@ public partial class App : WpfApplication
         catch { }
 
         base.OnStartup(e);
+
+        var window = new MainWindow();
+        MainWindow = window;
+        window.Show();
+
+        if (e.Args.Any(arg => string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase)))
+            window.Hide();
     }
 
     protected override void OnExit(WpfExitEventArgs e)

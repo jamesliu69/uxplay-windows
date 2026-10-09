@@ -10,14 +10,15 @@ name = "airplayd"
 path = "src/main.rs"
 
 [dependencies]
-airplay-mdns.workspace = true
-airplay-protocol.workspace = true
-airplay-crypto.workspace = true
-airplay-video.workspace = true
-airplay-audio.workspace = true
 airplay-ipc.workspace = true
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rand.workspace = true
+shairplay = { version = "=0.10.0", features = ["video"] }
+openh264 = "0.9"
+minifb = "0.28"
+cpal = "0.17"

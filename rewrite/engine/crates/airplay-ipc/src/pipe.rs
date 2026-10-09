@@ -93,14 +93,9 @@ where
 {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if out.send(line).await.is_err() {
-                    break;
-                }
-            }
-            _ => break,
+    while let Ok(Some(line)) = lines.next_line().await {
+        if out.send(line).await.is_err() {
+            break;
         }
     }
 }

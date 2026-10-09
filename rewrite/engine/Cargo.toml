@@ -15,25 +15,9 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-mdns-sd = "0.13"
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-sha2 = "0.10"
-hmac = "0.12"
-aes = "0.8"
-ctr = "0.9"
-chacha20 = "0.9"
 rand = "0.8"
-hex = "0.4"
-num-bigint = "0.4"
 
-airplay-mdns = { path = "crates/airplay-mdns" }
-airplay-protocol = { path = "crates/airplay-protocol" }
-airplay-crypto = { path = "crates/airplay-crypto" }
-airplay-video = { path = "crates/airplay-video" }
-airplay-audio = { path = "crates/airplay-audio" }
 airplay-ipc = { path = "crates/airplay-ipc" }
-airplay-session = { path = "crates/airplay-session" }
 
 [profile.release]
 lto = "thin"

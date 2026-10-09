@@ -31,6 +31,8 @@ public sealed class EngineController : IAsyncDisposable
 
     public Task ConnectAsync(CancellationToken ct = default) => _client.ConnectAsync(ct);
 
+    public Task DisconnectAsync() => _client.DisconnectAsync();
+
     public async Task<StatusResponse> StatusAsync(CancellationToken ct = default)
     {
         var result = await _client.InvokeAsync("status", null, ct).ConfigureAwait(false);

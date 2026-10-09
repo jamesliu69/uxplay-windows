@@ -141,17 +141,44 @@ public partial class MainWindow : Window
         StartButton.IsEnabled = false;
         try
         {
-            _app.EngineProcess.Start();
+            var engineExe = EngineProcessManager.FindEngineExe()
+                ?? throw new FileNotFoundException("airplayd.exe not found");
+            var firewall = await FirewallHelper.EnsurePrivateInboundRuleAsync(engineExe);
+            if (firewall == FirewallHelper.SetupResult.Cancelled)
+            {
+                AppendLog("warn", "Windows Firewall access was not granted; iPhone discovery or connection may be blocked.");
+            }
+            else if (firewall == FirewallHelper.SetupResult.Failed)
+            {
+                AppendLog("warn", "Could not configure the Windows Firewall rule; iPhone discovery or connection may be blocked.");
+            }
+            else if (firewall == FirewallHelper.SetupResult.Configured)
+            {
+                AppendLog("info", "Windows Firewall private-network rule configured for airplayd.");
+            }
+
+            _app.EngineProcess.Start(engineExe);
             AppendLog("info", "airplayd process started.");
             await _app.Controller.ConnectAsync();
             PipeText.Text = "connected to airplayd";
             var status = await _app.Controller.StartAsync(CollectParams());
-            RefreshButtons(status.Running, status.State);
             DetailText.Text = status.Detail;
+            if (!status.Running)
+            {
+                AppendLog("error", $"Engine failed to start: {status.Detail}");
+                await _app.Controller.DisconnectAsync();
+                _app.EngineProcess.Stop();
+                RefreshButtons(running: false, state: status.State);
+                return;
+            }
+
+            RefreshButtons(running: true, state: status.State);
             AppendLog("info", $"Engine state: {status.State}");
         }
         catch (Exception ex)
         {
+            try { await _app.Controller.DisconnectAsync(); } catch { }
+            _app.EngineProcess.Stop();
             DetailText.Text = ex.Message;
             AppendLog("error", $"Start failed: {ex.Message}");
             RefreshButtons(running: false, state: "idle");
@@ -164,11 +191,15 @@ public partial class MainWindow : Window
         {
             if (_app.Controller.IsConnected)
                 await _app.Controller.StopAsync();
-            await _app.Controller.DisposeAsync();
         }
         catch (Exception ex)
         {
             AppendLog("warn", $"Stop RPC failed (stopping process anyway): {ex.Message}");
+        }
+        finally
+        {
+            try { await _app.Controller.DisconnectAsync(); }
+            catch (Exception ex) { AppendLog("warn", $"IPC disconnect failed: {ex.Message}"); }
         }
         _app.EngineProcess.Stop();
         RefreshButtons(running: false, state: "idle");
