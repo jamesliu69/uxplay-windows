@@ -1,9 +1,10 @@
 //! AP1 RTP packet buffer with AES-CBC decryption and codec decode to f32.
 //!
 //! Incoming RTP packets are queued by sequence number into a fixed-size circular
-//! buffer. Each packet is decrypted (AES-128-CBC) and decoded on arrival — either
-//! ALAC (`AppleLossless`), mirroring AAC-ELD (`AAC-eld/<rate>/<ch>`) or raw
-//! PCM (`L16/<rate>/<ch>`).
+//! buffer. Each packet is decrypted (AES-128-CBC) on arrival. Mirroring AAC-ELD
+//! (`AAC-eld/<rate>/<ch>`) is decoded only when dequeued in sequence order because
+//! its decoder retains history across frames. ALAC (`AppleLossless`) and raw
+//! PCM (`L16/<rate>/<ch>`) are decoded on arrival.
 //! The consumer dequeues packets in order, with silence substitution for missing
 //! packets and optional retransmit requests for gaps.
 
@@ -42,6 +43,100 @@ mod codec_tests {
         packet[2..4].copy_from_slice(&sequence.to_be_bytes());
         packet.extend_from_slice(payload);
         packet
+    }
+
+    fn aac_eld_fixture_frames() -> Vec<&'static [u8]> {
+        let mut fixture =
+            include_bytes!("../codec/fixtures/eld-44100-stereo-480.frames").as_slice();
+        let mut frames = Vec::new();
+        while !fixture.is_empty() {
+            let len = u16::from_be_bytes([fixture[0], fixture[1]]) as usize;
+            frames.push(&fixture[2..2 + len]);
+            fixture = &fixture[2 + len..];
+        }
+        frames
+    }
+
+    fn ordered_aac_eld_samples(frames: &[&[u8]]) -> Vec<f32> {
+        let mut buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480").unwrap();
+        let mut samples = Vec::new();
+        for (sequence, payload) in frames.iter().enumerate() {
+            assert_eq!(buffer.queue(&rtp_packet(sequence as u16, payload), true), 1);
+            samples.extend_from_slice(buffer.dequeue(false).unwrap());
+        }
+        samples
+    }
+
+    fn assert_same_aac_eld_samples(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        let max_difference = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            max_difference, 0.0,
+            "packet arrival order must not change AAC decoder history"
+        );
+    }
+
+    #[test]
+    fn aac_eld_decodes_reordered_packets_in_sequence() {
+        let frames = aac_eld_fixture_frames();
+        let expected = ordered_aac_eld_samples(&frames);
+        // Also exercise a missing packet immediately before sequence wrap.
+        for first_sequence in [0u16, u16::MAX - 4] {
+            let mut buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480").unwrap();
+            let mut actual = Vec::new();
+            for index in [0, 1, 2, 3, 5, 4, 6, 7, 8, 9, 10, 11] {
+                let sequence = first_sequence.wrapping_add(index as u16);
+                let packet = rtp_packet(sequence, frames[index]);
+                assert_eq!(buffer.queue(&packet, true), 1);
+                if index == 5 {
+                    assert!(buffer.dequeue(false).is_none(), "wait for packet 4");
+                    assert_eq!(buffer.queue(&packet, true), 0, "ignore duplicate");
+                }
+                while let Some(samples) = buffer.dequeue(false) {
+                    actual.extend_from_slice(samples);
+                }
+            }
+            assert_same_aac_eld_samples(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn aac_eld_flush_discards_pending_packets_without_decoding() {
+        let frames = aac_eld_fixture_frames();
+        let expected = ordered_aac_eld_samples(&frames);
+        let mut buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480").unwrap();
+        assert_eq!(buffer.queue(&rtp_packet(5, frames[5]), true), 1);
+        buffer.flush(-1);
+        let mut actual = Vec::new();
+        for (sequence, payload) in frames.iter().enumerate() {
+            assert_eq!(buffer.queue(&rtp_packet(sequence as u16, payload), true), 1);
+            actual.extend_from_slice(buffer.dequeue(false).unwrap());
+        }
+        assert_same_aac_eld_samples(&actual, &expected);
+    }
+
+    #[test]
+    fn aac_eld_decode_failure_emits_silence_and_keeps_draining() {
+        let frames = aac_eld_fixture_frames();
+        let mut buffer = RaopBuffer::new_unencrypted("96 AAC-eld/44100/2", "96 480").unwrap();
+        assert_eq!(buffer.queue(&rtp_packet(0, frames[0]), true), 1);
+        assert_eq!(buffer.queue(&rtp_packet(1, &[0]), true), 1);
+        assert_eq!(buffer.queue(&rtp_packet(2, frames[2]), true), 1);
+        assert_eq!(buffer.dequeue(false).unwrap().len(), 960);
+        let silence = buffer
+            .dequeue(false)
+            .expect("invalid frame consumes its slot");
+        assert_eq!(silence.len(), 960);
+        assert!(silence.iter().all(|&sample| sample == 0.0));
+        let next = buffer.dequeue(false).expect("next packet must still drain");
+        assert_eq!(next.len(), 960);
+        assert!(next.iter().all(|sample| sample.is_finite()));
+        assert!(next.iter().any(|&sample| sample != 0.0));
+        assert!(buffer.dequeue(false).is_none());
     }
 
     #[test]
@@ -197,9 +292,9 @@ enum CodecConfig {
     AacEld(PcmConfig),
 }
 
-/// A single slot in the circular buffer holding one decoded audio frame.
+/// A single slot holding a pending AAC-ELD packet or a decoded audio frame.
 struct BufferEntry {
-    /// Whether this slot contains a valid decoded frame.
+    /// Whether this slot contains a queued packet/frame.
     available: bool,
     /// RTP flags byte (first byte of RTP header).
     flags: u8,
@@ -211,6 +306,8 @@ struct BufferEntry {
     timestamp: u32,
     /// RTP synchronization source identifier.
     ssrc: u32,
+    /// Decrypted AAC-ELD access unit, retained until ordered dequeue.
+    encoded_audio: Vec<u8>,
     /// Decoded F32 audio samples. Pre-allocated to the per-entry capacity.
     audio_buffer: Vec<f32>,
     /// Actual number of valid samples in `audio_buffer`.
@@ -335,7 +432,8 @@ fn build_decoder_info(config: &AlacConfig) -> [u8; 48] {
 /// # Audio pipeline
 ///
 /// ```text
-/// RTP packet → AES-128-CBC decrypt → ALAC/AAC-ELD/L16 decode → f32 → buffer slot
+/// AAC-ELD: RTP → decrypt → buffer slot → ordered dequeue → decode → f32
+/// ALAC/L16: RTP → decrypt → decode → f32 → buffer slot → ordered dequeue
 /// ```
 pub struct RaopBuffer {
     aes: Option<AesSession>,
@@ -349,7 +447,7 @@ pub struct RaopBuffer {
     /// Number of f32 samples one decoded frame's buffer can hold (allocation size).
     frame_capacity: usize,
     /// Number of f32 samples to emit when substituting silence for a lost frame.
-    /// Constant for ALAC (fixed frame size); tracks the last real frame for PCM.
+    /// Constant for AAC-ELD/ALAC; tracks the last real frame for PCM.
     silence_samples: usize,
 }
 
@@ -435,6 +533,7 @@ impl RaopBuffer {
                 seqnum: 0,
                 timestamp: 0,
                 ssrc: 0,
+                encoded_audio: Vec::new(),
                 audio_buffer: vec![0.0f32; frame_capacity],
                 audio_buffer_len: 0,
             })
@@ -470,9 +569,11 @@ impl RaopBuffer {
         }
     }
 
-    /// Queue an RTP packet: decrypt, decode the negotiated codec, store f32.
+    /// Queue an RTP packet: decrypt and store AAC-ELD for ordered decoding,
+    /// or decode ALAC/L16 immediately and store f32.
     ///
-    /// Returns 1 on success, 0 if duplicate/stale, -1 if packet is malformed.
+    /// Returns 1 when accepted, 0 if duplicate/stale, -1 if packet is malformed.
+    /// AAC-ELD codec errors are detected on dequeue and substituted with silence.
     /// If the sequence number is far ahead of the current window, the buffer is
     /// flushed to avoid stalling on lost packets.
     pub fn queue(&mut self, data: &[u8], use_seqnum: bool) -> i32 {
@@ -510,6 +611,7 @@ impl RaopBuffer {
         // A failed replacement must not leave stale data available in this slot.
         self.entries[idx].available = false;
         self.entries[idx].audio_buffer_len = 0;
+        self.entries[idx].encoded_audio.clear();
 
         // AES-128-CBC decrypt: only full 16-byte blocks are encrypted,
         // trailing bytes (< 16) are sent in the clear.
@@ -529,16 +631,18 @@ impl RaopBuffer {
             Cow::Borrowed(payload)
         };
 
-        // Decode into the slot's f32 buffer.
+        // AAC-ELD is stateful: decoding before reordering corrupts its history
+        // even if the resulting PCM is later played in sequence order.
         let capacity = self.frame_capacity;
         let num_samples = match &mut self.codec {
-            Codec::AacEld { decoder, .. } => {
-                let Some(samples) = decoder.decode(&packet_buf) else {
+            Codec::AacEld { .. } => {
+                if packet_buf.is_empty() {
                     return -1;
-                };
-                let count = samples.len();
-                self.entries[idx].audio_buffer[..count].copy_from_slice(&samples);
-                count
+                }
+                self.entries[idx]
+                    .encoded_audio
+                    .extend_from_slice(&packet_buf);
+                0
             }
             Codec::Alac { decoder, .. } => {
                 // The decoder handles both negotiated 16-bit and 24-bit ALAC.
@@ -598,7 +702,8 @@ impl RaopBuffer {
     /// Returns the decoded f32 audio samples, or `None` if the buffer is empty.
     /// If the next frame is missing and `no_resend` is false, returns `None`
     /// to allow time for a retransmit. If `no_resend` is true (or the buffer
-    /// is full), substitutes silence for the missing frame.
+    /// is full), substitutes silence for the missing frame. AAC-ELD is decoded
+    /// here, after reordering; an invalid access unit also produces silence.
     pub fn dequeue(&mut self, no_resend: bool) -> Option<&[f32]> {
         let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
         if self.is_empty || buflen <= 0 {
@@ -613,13 +718,27 @@ impl RaopBuffer {
 
         self.first_seqnum = self.first_seqnum.wrapping_add(1);
 
-        // Substitute silence for missing frames.
+        if self.entries[idx].available
+            && let Codec::AacEld { decoder, .. } = &mut self.codec
+        {
+            let entry = &mut self.entries[idx];
+            if let Some(samples) = decoder.decode(&entry.encoded_audio) {
+                entry.audio_buffer_len = samples.len();
+                entry.audio_buffer[..samples.len()].copy_from_slice(&samples);
+            } else {
+                // Consume a corrupt packet without stalling subsequent audio.
+                entry.available = false;
+            }
+        }
+
+        // Substitute silence for missing or undecodable frames.
         if !self.entries[idx].available {
             let size = self.silence_samples.min(self.frame_capacity);
             self.entries[idx].audio_buffer[..size].fill(0.0);
             self.entries[idx].audio_buffer_len = size;
         }
         self.entries[idx].available = false;
+        self.entries[idx].encoded_audio.clear();
         let len = self.entries[idx].audio_buffer_len;
         self.entries[idx].audio_buffer_len = 0;
         Some(&self.entries[idx].audio_buffer[..len])
@@ -632,6 +751,7 @@ impl RaopBuffer {
     pub fn flush(&mut self, next_seq: i32) {
         for entry in &mut self.entries {
             entry.available = false;
+            entry.encoded_audio.clear();
             entry.audio_buffer_len = 0;
         }
         if !(0..=0xffff).contains(&next_seq) {

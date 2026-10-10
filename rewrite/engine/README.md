@@ -48,6 +48,26 @@ RTSP error and a log entry. Decoded PCM is mapped to the default Windows output
 device's channel count. A physical iPhone is still required to verify sustained
 wireless playback and audible output on the selected device.
 
+AAC-ELD RTP packets are decrypted on arrival and decoded only when dequeued in
+sequence order. This preserves decoder history when packets arrive out of order;
+sorting already-decoded PCM cannot repair that history. Duplicate/stale packets
+and packets discarded by a flush do not enter the decoder. An undecodable access
+unit is consumed as one frame of silence so later packets can continue draining.
+
+Audio output accumulates 60 ms of PCM before starting or recovering from an
+underrun, adding approximately 60 ms of playback latency to absorb packet jitter.
+Five-millisecond ramps soften startup, underrun recovery and overflow transitions.
+The queue remains capped at 750 ms and discards only complete device frames when
+full. Flush and session replacement reset the queue and its transition state.
+
+When system audio is available, decoded video frames wait for the same 60 ms
+before presentation to compensate for the added audio buffering. The renderer
+selects the newest due frame after a stall, keeps at most eight pending decoded
+frames, and discards pending frames on stream end or replacement. Decoding and
+window event handling remain independent of this wait. Disabled audio adds no
+video holdback. This compensates the software buffer only; it is not a shared
+RTP/NTP presentation clock and does not measure transport or device latency.
+
 ## Layout
 - `crates/airplay-ipc` — NDJSON JSON-RPC server over Windows named pipe (control plane for the GUI).
 - `crates/airplayd` — receiver daemon, persistent pairing identity, AirPlay runtime, and H.264 render window.

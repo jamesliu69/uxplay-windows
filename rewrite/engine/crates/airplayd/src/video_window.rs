@@ -1,11 +1,12 @@
 //! H.264 screen-mirroring decoder and native render window.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use minifb::{Key, Menu, ScaleMode, Window, WindowOptions, MENU_KEY_CTRL};
+use minifb::{Key, MENU_KEY_CTRL, Menu, ScaleMode, Window, WindowOptions};
 #[cfg(test)]
 use openh264::decoder::{Decoder, DecoderConfig, Flush};
 #[cfg(test)]
@@ -19,6 +20,10 @@ use crate::video_capture::MirrorCapture;
 use crate::video_color::VideoColor;
 use crate::video_decoder::{DecodedFrame, DecoderControl, FfmpegDecoder};
 use crate::window_size::{self, WindowSize};
+
+// Bound decoded-frame memory even if frames arrive in a burst. Compressed
+// H.264 access units remain ordered and are never dropped by this queue.
+const MAX_PRESENTATION_FRAMES: usize = 8;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -45,7 +50,39 @@ struct FrameSlot {
     stream_id: u64,
     active: bool,
     latest: Option<DecodedFrame>,
+    pending: VecDeque<DecodedFrame>,
     window_handle: isize,
+}
+
+impl FrameSlot {
+    fn clear_frames(&mut self) {
+        self.latest = None;
+        self.pending.clear();
+    }
+
+    fn take_presentable(&mut self, now: Instant, audio_delay: Duration) -> Option<DecodedFrame> {
+        if !self.active {
+            self.clear_frames();
+            return None;
+        }
+        if let Some(frame) = self.latest.take() {
+            self.pending.push_back(frame);
+        }
+        while self.pending.len() > MAX_PRESENTATION_FRAMES {
+            self.pending.pop_front();
+        }
+        // Present the newest due frame after a render pause. Newer frames must
+        // still wait for audio's software buffering, without blocking decoding.
+        let mut due = None;
+        while self
+            .pending
+            .front()
+            .is_some_and(|frame| now.saturating_duration_since(frame.decoded_at) >= audio_delay)
+        {
+            due = self.pending.pop_front();
+        }
+        due
+    }
 }
 
 type ActiveDecoder = Arc<Mutex<Option<(u64, DecoderControl)>>>;
@@ -60,7 +97,7 @@ pub struct VideoWindowRuntime {
 }
 
 impl VideoWindowRuntime {
-    pub fn start(display: (u32, u32, u32)) -> Self {
+    pub fn start(display: (u32, u32, u32), audio_delay: Duration) -> Self {
         let (tx, rx) = mpsc::channel(8);
         let frames = Arc::new(Mutex::new(FrameSlot::default()));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -72,7 +109,12 @@ impl VideoWindowRuntime {
             thread::spawn(move || decode_loop(rx, decode_frames, decode_stopped, decode_control));
         let render_frames = frames.clone();
         let render_stopped = stopped.clone();
-        let renderer = thread::spawn(move || render_loop(render_frames, render_stopped));
+        let renderer =
+            thread::spawn(move || render_loop(render_frames, render_stopped, audio_delay));
+        info!(
+            audio_buffer_ms = audio_delay.as_millis(),
+            "Mirror presentation delay configured"
+        );
         Self {
             handler: Arc::new(MirrorVideoHandler {
                 tx,
@@ -136,7 +178,7 @@ impl VideoHandler for MirrorVideoHandler {
             let mut frames = self.frames.lock().unwrap();
             frames.stream_id = frames.stream_id.wrapping_add(1);
             frames.active = true;
-            frames.latest = None;
+            frames.clear_frames();
             frames.stream_id
         };
         info!(stream_id, "AirPlay mirror video stream started");
@@ -197,7 +239,7 @@ impl VideoSession for MirrorVideoSession {
         let ended = if let Ok(mut frames) = self.frames.lock() {
             if frames.stream_id == self.stream_id && frames.active {
                 frames.active = false;
-                frames.latest = None;
+                frames.clear_frames();
                 true
             } else {
                 false
@@ -415,7 +457,7 @@ fn decode_loop(
 }
 
 fn h264_dimensions(annex_b: &[u8]) -> Option<(usize, usize)> {
-    use h264_reader::nal::{sps::SeqParameterSet, Nal, RefNal};
+    use h264_reader::nal::{Nal, RefNal, sps::SeqParameterSet};
     // Our AvcC and packet converters always produce four-byte start codes.
     let offsets: Vec<usize> = annex_b
         .windows(4)
@@ -503,7 +545,7 @@ impl Drop for PlaybackWindow {
     }
 }
 
-fn render_loop(frames: Arc<Mutex<FrameSlot>>, stopped: Arc<AtomicBool>) {
+fn render_loop(frames: Arc<Mutex<FrameSlot>>, stopped: Arc<AtomicBool>, audio_delay: Duration) {
     let mut playback: Option<PlaybackWindow> = None;
     let mut current_frame: Option<DecodedFrame> = None;
     let mut stream_id = 0;
@@ -515,7 +557,8 @@ fn render_loop(frames: Arc<Mutex<FrameSlot>>, stopped: Arc<AtomicBool>) {
         let mut retired_frame = None;
         let (active, incoming_stream, latest) = {
             let mut slot = frames.lock().unwrap();
-            (slot.active, slot.stream_id, slot.latest.take())
+            let latest = slot.take_presentable(Instant::now(), audio_delay);
+            (slot.active, slot.stream_id, latest)
         };
         if incoming_stream != stream_id {
             stream_id = incoming_stream;
@@ -779,6 +822,191 @@ fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn presentation_frame(id: u32, decoded_at: Instant) -> DecodedFrame {
+        DecodedFrame {
+            pixels: vec![id],
+            width: 1,
+            height: 1,
+            decoded_at,
+        }
+    }
+
+    #[test]
+    fn presentation_waits_for_audio_buffer_delay() {
+        let start = Instant::now();
+        let delay = Duration::from_millis(60);
+        let mut slot = FrameSlot {
+            active: true,
+            latest: Some(presentation_frame(7, start)),
+            ..FrameSlot::default()
+        };
+        assert!(
+            slot.take_presentable(start + delay - Duration::from_millis(1), delay)
+                .is_none()
+        );
+        let frame = slot
+            .take_presentable(start + delay, delay)
+            .expect("frame is due");
+        assert_eq!(frame.pixels, [7]);
+        assert!(slot.take_presentable(start + delay, delay).is_none());
+    }
+
+    #[test]
+    fn presentation_retains_due_frame_when_newer_frame_is_not_due() {
+        let start = Instant::now();
+        let delay = Duration::from_millis(60);
+        let mut slot = FrameSlot {
+            active: true,
+            latest: Some(presentation_frame(1, start)),
+            ..FrameSlot::default()
+        };
+        assert!(slot.take_presentable(start, delay).is_none());
+        slot.latest = Some(presentation_frame(2, start + Duration::from_millis(40)));
+        let frame = slot
+            .take_presentable(start + delay, delay)
+            .expect("older frame is due");
+        assert_eq!(frame.pixels, [1]);
+        assert!(
+            slot.take_presentable(start + Duration::from_millis(99), delay)
+                .is_none()
+        );
+        assert_eq!(
+            slot.take_presentable(start + Duration::from_millis(100), delay)
+                .unwrap()
+                .pixels,
+            [2]
+        );
+    }
+
+    #[test]
+    fn presentation_catches_up_after_render_pause() {
+        let start = Instant::now();
+        let delay = Duration::from_millis(60);
+        let mut slot = FrameSlot {
+            active: true,
+            ..FrameSlot::default()
+        };
+        for id in 0..3 {
+            let decoded_at = start + Duration::from_millis(u64::from(id) * 20);
+            slot.latest = Some(presentation_frame(id, decoded_at));
+            assert!(slot.take_presentable(decoded_at, delay).is_none());
+        }
+        let resumed_at = start + Duration::from_millis(200);
+        slot.latest = Some(presentation_frame(3, resumed_at));
+        assert_eq!(
+            slot.take_presentable(resumed_at, delay).unwrap().pixels,
+            [2]
+        );
+        assert!(slot.take_presentable(resumed_at, delay).is_none());
+        assert_eq!(
+            slot.take_presentable(resumed_at + delay, delay)
+                .unwrap()
+                .pixels,
+            [3]
+        );
+    }
+
+    #[test]
+    fn presentation_without_audio_delay_remains_immediate() {
+        let start = Instant::now();
+        let mut slot = FrameSlot {
+            active: true,
+            latest: Some(presentation_frame(7, start)),
+            ..FrameSlot::default()
+        };
+        assert_eq!(
+            slot.take_presentable(start, Duration::ZERO).unwrap().pixels,
+            [7]
+        );
+    }
+
+    #[test]
+    fn presentation_bounds_decoded_frame_bursts() {
+        let start = Instant::now();
+        let delay = Duration::from_millis(60);
+        let mut slot = FrameSlot {
+            active: true,
+            ..FrameSlot::default()
+        };
+        for id in 0..100 {
+            slot.latest = Some(presentation_frame(id, start));
+            assert!(slot.take_presentable(start, delay).is_none());
+            assert!(slot.pending.len() <= MAX_PRESENTATION_FRAMES);
+        }
+        assert_eq!(
+            slot.take_presentable(start + delay, delay).unwrap().pixels,
+            [99]
+        );
+        assert!(slot.pending.is_empty());
+    }
+
+    #[test]
+    fn presentation_session_replacement_discards_old_frames() {
+        let start = Instant::now();
+        let delay = Duration::from_millis(60);
+        let (tx, _rx) = mpsc::channel(8);
+        let frames = Arc::new(Mutex::new(FrameSlot::default()));
+        let handler = MirrorVideoHandler {
+            tx,
+            frames: frames.clone(),
+            display: (1280, 720, 30),
+            decoder_control: Arc::new(Mutex::new(None)),
+        };
+        let old = handler.video_init();
+        {
+            let mut slot = frames.lock().unwrap();
+            slot.latest = Some(presentation_frame(1, start));
+            assert!(slot.take_presentable(start, delay).is_none());
+        }
+        let new = handler.video_init();
+        {
+            let mut slot = frames.lock().unwrap();
+            assert!(slot.pending.is_empty());
+            slot.latest = Some(presentation_frame(2, start));
+            assert!(slot.take_presentable(start, delay).is_none());
+        }
+        drop(old);
+        assert_eq!(
+            frames
+                .lock()
+                .unwrap()
+                .take_presentable(start + delay, delay)
+                .unwrap()
+                .pixels,
+            [2]
+        );
+        {
+            let mut slot = frames.lock().unwrap();
+            slot.latest = Some(presentation_frame(3, start + delay));
+            assert!(slot.take_presentable(start + delay, delay).is_none());
+        }
+        drop(new);
+        assert!(frames.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn presentation_inactive_stream_discards_waiting_frames() {
+        let start = Instant::now();
+        let delay = Duration::from_millis(60);
+        let mut slot = FrameSlot {
+            active: true,
+            latest: Some(presentation_frame(1, start)),
+            ..FrameSlot::default()
+        };
+        assert!(slot.take_presentable(start, delay).is_none());
+        slot.active = false;
+        assert!(slot.take_presentable(start + delay, delay).is_none());
+        slot.active = true;
+        slot.latest = Some(presentation_frame(2, start + delay));
+        assert!(slot.take_presentable(start + delay, delay).is_none());
+        assert_eq!(
+            slot.take_presentable(start + delay * 2, delay)
+                .unwrap()
+                .pixels,
+            [2]
+        );
+    }
 
     #[test]
     fn ffmpeg_releases_first_live_frame_without_waiting_for_another_packet() {
@@ -1050,7 +1278,7 @@ mod tests {
     #[test]
     #[ignore = "opens a native window for interactive size-menu and rotation verification"]
     fn native_window_size_smoke() {
-        let runtime = VideoWindowRuntime::start((1920, 1080, 30));
+        let runtime = VideoWindowRuntime::start((1920, 1080, 30), Duration::ZERO);
         let handler = runtime.handler();
         let mut session = handler.video_init();
         session.on_video(encoded_picture(1920, 1080));
@@ -1353,16 +1581,18 @@ mod tests {
                 avcc.push(1);
                 avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
                 avcc.extend_from_slice(&pps);
-                assert!(decode_packet(
-                    &mut decoder,
-                    &mut configuration,
-                    VideoPacket {
-                        kind: PacketKind::AvcC,
-                        timestamp: frame as u64,
-                        payload: avcc.into()
-                    },
-                )
-                .is_none());
+                assert!(
+                    decode_packet(
+                        &mut decoder,
+                        &mut configuration,
+                        VideoPacket {
+                            kind: PacketKind::AvcC,
+                            timestamp: frame as u64,
+                            payload: avcc.into()
+                        },
+                    )
+                    .is_none()
+                );
             }
             if frame == 24 {
                 // Native fatal errors reset OpenH264's parameter sets. The

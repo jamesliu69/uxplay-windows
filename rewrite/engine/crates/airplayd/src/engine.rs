@@ -12,7 +12,7 @@ use shairplay::{PairingStore, RaopServer};
 use tracing::{info, warn};
 
 use crate::audio_output::AudioOutputRuntime;
-use crate::video_window::{discard_video_handler, VideoWindowRuntime};
+use crate::video_window::{VideoWindowRuntime, discard_video_handler};
 
 const AIRPLAY_PORT: u16 = 7100;
 
@@ -51,16 +51,16 @@ impl EngineHandle {
             .port(AIRPLAY_PORT)
             .pairing_store(self.persistent_state.pairing_store());
 
+        let audio_output = AudioOutputRuntime::start();
         let video_window = if self.params.audio_only {
             builder = builder.video_handler(discard_video_handler());
             None
         } else {
-            let runtime = VideoWindowRuntime::start(display);
+            let runtime = VideoWindowRuntime::start(display, audio_output.buffer_delay());
             builder = builder.video_handler(runtime.handler());
             Some(runtime)
         };
 
-        let audio_output = AudioOutputRuntime::start();
         if let Some(sample_rate) = audio_output.sample_rate() {
             builder = builder.output_sample_rate(sample_rate);
         }
