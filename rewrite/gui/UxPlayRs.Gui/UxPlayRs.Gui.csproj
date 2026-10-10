@@ -8,9 +8,11 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>UxPlayRs.Gui</AssemblyName>
+    <ApplicationIcon>..\..\..\stuff\UxPlayRs.Gui.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
+    <Resource Include="$(ApplicationIcon)" Link="Assets\UxPlayRs.Gui.ico" />
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>UxPlayRs.Gui.Tests</_Parameter1>
     </AssemblyAttribute>

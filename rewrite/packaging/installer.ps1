@@ -63,7 +63,7 @@ try {
   $wixArgs = @('wix', 'build', (Join-Path $PSScriptRoot 'product.wxs'),
     '-acceptEula', 'wix7', '-arch', $Architecture, '-culture', 'zh-TW',
     '-ext', 'WixToolset.UI.wixext', '-d', "BundleDir=$BundleDir",
-    '-d', "ProductVersion=$Version", '-d', "AppIcon=$(Join-Path $RepoRoot 'stuff\newicon.ico')",
+    '-d', "ProductVersion=$Version", '-d', "AppIcon=$(Join-Path $RepoRoot 'stuff\UxPlayRs.Gui.ico')",
     '-d', "LicenseRtf=$(Join-Path $PSScriptRoot 'license.rtf')",
     '-out', $MsiPath, '-pdbtype', 'none', '-cc', (Join-Path $ArtifactsDir 'wix-cabcache'))
   & dotnet @wixArgs

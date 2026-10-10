@@ -1,7 +1,9 @@
 <Window x:Class="UxPlayRs.Gui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="UxPlayRs" Height="560" Width="420" MinWidth="380" MinHeight="480">
+        Title="UxPlayRs"
+        Icon="pack://application:,,,/UxPlayRs.Gui;component/Assets/UxPlayRs.Gui.ico"
+        Height="560" Width="420" MinWidth="380" MinHeight="480">
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
