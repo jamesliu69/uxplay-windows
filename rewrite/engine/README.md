@@ -60,6 +60,15 @@ Five-millisecond ramps soften startup, underrun recovery and overflow transition
 The queue remains capped at 750 ms and discards only complete device frames when
 full. Flush and session replacement reset the queue and its transition state.
 
+If Windows invalidates the active audio device (for example after a monitor or
+audio endpoint reconnects), a background stream owner releases the failed output
+and retries the current default device every 500 ms. Recovery discards queued
+PCM and requires a fresh prefill; it preserves the AirPlay session, volume and
+negotiated rate/channel count. WASAPI shared-mode conversion handles a different
+replacement endpoint mix format. A brief buffer underrun does not reopen the
+device. If no usable device exists when the receiver initially starts, audio
+remains disabled until Stop/Start with a device available.
+
 When system audio is available, decoded video frames wait for the same 60 ms
 before presentation to compensate for the added audio buffering. The renderer
 selects the newest due frame after a stall, keeps at most eight pending decoded
@@ -93,6 +102,14 @@ Native display checks (open test windows; run on an interactive Windows desktop)
 cargo test -p airplayd native_downscaling_preserves_colors -- --ignored --nocapture
 cargo test -p airplayd native_window_size_smoke -- --ignored --nocapture
 ```
+
+Native audio recovery check (requires a real default audio output):
+```powershell
+cargo test -p airplayd real_audio_device_consumes_pcm_after_output_recovery -- --ignored --nocapture
+```
+This injects a device-unavailable error, reopens a real system stream, and checks
+that its callback drains silent PCM from the existing session. It does not change
+Windows devices or verify a physical unplug/replug or audible iPhone playback.
 
 ## Local capture diagnostics
 

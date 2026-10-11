@@ -1,8 +1,9 @@
 //! System audio output for decoded AirPlay PCM.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -13,11 +14,12 @@ use tracing::{info, warn};
 const MAX_BUFFER_MILLIS: usize = 750;
 const PREFILL_BUFFER_MILLIS: usize = 60;
 const TRANSITION_MILLIS: usize = 5;
+const OUTPUT_RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Keeps the OS audio stream alive and exposes the handler used by shairplay.
 pub struct AudioOutputRuntime {
     handler: Arc<SystemAudioHandler>,
-    _stream: Option<cpal::Stream>,
+    _output_worker: Option<OutputWorker>,
     sample_rate: Option<u32>,
     channels: Option<u8>,
 }
@@ -45,35 +47,20 @@ impl AudioOutputRuntime {
             usize::from(channels),
         )));
         let stream_config: cpal::StreamConfig = config.clone().into();
-
-        let stream = match config.sample_format() {
-            SampleFormat::I8 => build_output_stream::<i8>(&device, &stream_config, ring.clone()),
-            SampleFormat::I16 => build_output_stream::<i16>(&device, &stream_config, ring.clone()),
-            SampleFormat::I32 => build_output_stream::<i32>(&device, &stream_config, ring.clone()),
-            SampleFormat::I64 => build_output_stream::<i64>(&device, &stream_config, ring.clone()),
-            SampleFormat::U8 => build_output_stream::<u8>(&device, &stream_config, ring.clone()),
-            SampleFormat::U16 => build_output_stream::<u16>(&device, &stream_config, ring.clone()),
-            SampleFormat::U32 => build_output_stream::<u32>(&device, &stream_config, ring.clone()),
-            SampleFormat::U64 => build_output_stream::<u64>(&device, &stream_config, ring.clone()),
-            SampleFormat::F32 => build_output_stream::<f32>(&device, &stream_config, ring.clone()),
-            SampleFormat::F64 => build_output_stream::<f64>(&device, &stream_config, ring.clone()),
-            _ => {
-                warn!(format = ?config.sample_format(), "Unsupported system audio sample format");
-                return Self::disabled();
-            }
-        };
-
-        let stream = match stream {
+        let needs_rebuild = Arc::new(AtomicBool::new(false));
+        let stream = match open_output_stream(
+            &device,
+            &stream_config,
+            config.sample_format(),
+            ring.clone(),
+            needs_rebuild.clone(),
+        ) {
             Ok(stream) => stream,
             Err(error) => {
                 warn!(%error, "Could not start the default audio output device; AirPlay audio will be discarded");
                 return Self::disabled();
             }
         };
-        if let Err(error) = stream.play() {
-            warn!(%error, "Could not start the default audio output device; AirPlay audio will be discarded");
-            return Self::disabled();
-        }
 
         let device_name = device
             .description()
@@ -87,13 +74,20 @@ impl AudioOutputRuntime {
             "System audio output ready"
         );
 
+        let output_worker = OutputWorker::start(
+            stream,
+            stream_config,
+            config.sample_format(),
+            ring.clone(),
+            needs_rebuild,
+        );
         Self {
             handler: Arc::new(SystemAudioHandler {
                 ring,
                 gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
                 output_channels: usize::from(channels),
             }),
-            _stream: Some(stream),
+            _output_worker: Some(output_worker),
             sample_rate: Some(sample_rate),
             channels: u8::try_from(channels).ok(),
         }
@@ -128,17 +122,118 @@ impl AudioOutputRuntime {
                 gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
                 output_channels: 2,
             }),
-            _stream: None,
+            _output_worker: None,
             sample_rate: None,
             channels: None,
         }
     }
 }
 
+/// Owns the stream outside its callback so an invalidated device can be dropped
+/// and reopened without joining the callback thread from inside that callback.
+struct OutputWorker {
+    shutdown: mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OutputWorker {
+    fn start(
+        stream: cpal::Stream,
+        config: cpal::StreamConfig,
+        sample_format: SampleFormat,
+        ring: Arc<Mutex<AudioRing>>,
+        needs_rebuild: Arc<AtomicBool>,
+    ) -> Self {
+        let (shutdown, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let mut stream = Some(stream);
+            let mut failed_attempts = 0_u64;
+            while matches!(
+                receiver.recv_timeout(OUTPUT_RECOVERY_INTERVAL),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let result = recover_output(&mut stream, &needs_rebuild, &ring, || {
+                    let device = cpal::default_host()
+                        .default_output_device()
+                        .ok_or_else(|| anyhow::anyhow!("No default audio output device"))?;
+                    // Keep the format negotiated with shairplay. Windows WASAPI
+                    // shared mode converts it to the replacement endpoint's mix
+                    // format, even when its native rate/channel count differs.
+                    let stream = open_output_stream(
+                        &device,
+                        &config,
+                        sample_format,
+                        ring.clone(),
+                        needs_rebuild.clone(),
+                    )?;
+                    let device_name = device
+                        .description()
+                        .map(|description| description.name().to_string())
+                        .unwrap_or_else(|_| "default output".to_string());
+                    info!(
+                        device = %device_name,
+                        sample_rate = config.sample_rate,
+                        channels = config.channels,
+                        "System audio output recovered"
+                    );
+                    Ok::<_, anyhow::Error>(stream)
+                });
+                if let Err(error) = result {
+                    // Retry while unplugged, without flooding the GUI log.
+                    if failed_attempts % 20 == 0 {
+                        warn!(%error, "Could not reopen audio output; retrying automatically");
+                    }
+                    failed_attempts = failed_attempts.wrapping_add(1);
+                } else {
+                    failed_attempts = 0;
+                }
+            }
+        });
+        Self {
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OutputWorker {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn open_output_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: SampleFormat,
+    ring: Arc<Mutex<AudioRing>>,
+    needs_rebuild: Arc<AtomicBool>,
+) -> anyhow::Result<cpal::Stream> {
+    let stream = match sample_format {
+        SampleFormat::I8 => build_output_stream::<i8>(device, config, ring, needs_rebuild),
+        SampleFormat::I16 => build_output_stream::<i16>(device, config, ring, needs_rebuild),
+        SampleFormat::I32 => build_output_stream::<i32>(device, config, ring, needs_rebuild),
+        SampleFormat::I64 => build_output_stream::<i64>(device, config, ring, needs_rebuild),
+        SampleFormat::U8 => build_output_stream::<u8>(device, config, ring, needs_rebuild),
+        SampleFormat::U16 => build_output_stream::<u16>(device, config, ring, needs_rebuild),
+        SampleFormat::U32 => build_output_stream::<u32>(device, config, ring, needs_rebuild),
+        SampleFormat::U64 => build_output_stream::<u64>(device, config, ring, needs_rebuild),
+        SampleFormat::F32 => build_output_stream::<f32>(device, config, ring, needs_rebuild),
+        SampleFormat::F64 => build_output_stream::<f64>(device, config, ring, needs_rebuild),
+        _ => anyhow::bail!("Unsupported system audio sample format: {sample_format:?}"),
+    }?;
+    stream.play()?;
+    Ok(stream)
+}
+
 fn build_output_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     ring: Arc<Mutex<AudioRing>>,
+    needs_rebuild: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + FromSample<f32>,
@@ -155,9 +250,41 @@ where
 
             ring.render(data);
         },
-        |error| warn!(%error, "System audio output error"),
+        move |error| record_output_error(error, &needs_rebuild),
         None,
     )
+}
+
+fn record_output_error(error: cpal::StreamError, needs_rebuild: &AtomicBool) {
+    if !matches!(error, cpal::StreamError::BufferUnderrun) {
+        needs_rebuild.store(true, Ordering::Release);
+    }
+    warn!(%error, "System audio output error");
+}
+
+fn recover_output<S, E>(
+    stream: &mut Option<S>,
+    needs_rebuild: &AtomicBool,
+    ring: &Mutex<AudioRing>,
+    open: impl FnOnce() -> Result<S, E>,
+) -> Result<(), E> {
+    if !needs_rebuild.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    drop(stream.take());
+    if let Ok(mut ring) = ring.lock() {
+        ring.clear();
+    }
+    match open() {
+        Ok(replacement) => {
+            *stream = Some(replacement);
+            Ok(())
+        }
+        Err(error) => {
+            needs_rebuild.store(true, Ordering::Release);
+            Err(error)
+        }
+    }
 }
 
 struct AudioRing {
@@ -419,6 +546,153 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_output_reopens_and_current_session_can_play_again() {
+        struct DeviceStream(Arc<AtomicBool>);
+        impl Drop for DeviceStream {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let handler = handler(2);
+        let mut session = handler.audio_init(format(2));
+        handler.on_volume(-20.0);
+        session.audio_process(&[1.0, -1.0].repeat(2880));
+        let old_dropped = Arc::new(AtomicBool::new(false));
+        let mut stream = Some(DeviceStream(old_dropped.clone()));
+        let needs_rebuild = AtomicBool::new(false);
+
+        record_output_error(cpal::StreamError::DeviceNotAvailable, &needs_rebuild);
+        assert!(needs_rebuild.load(Ordering::Acquire));
+        recover_output(&mut stream, &needs_rebuild, &handler.ring, || {
+            assert!(old_dropped.load(Ordering::Acquire));
+            assert!(handler.ring.lock().unwrap().samples.is_empty());
+            Ok::<_, ()>(DeviceStream(Arc::new(AtomicBool::new(false))))
+        })
+        .unwrap();
+        assert!(old_dropped.load(Ordering::Acquire));
+        assert!(stream.is_some());
+        assert!(!needs_rebuild.load(Ordering::Acquire));
+        let mut ring = handler.ring.lock().unwrap();
+        assert_eq!(render_stereo(&mut ring, 10), vec![0.0; 20]);
+        drop(ring);
+
+        // Existing AirPlay session and volume survive; old queued PCM does not.
+        session.audio_process(&[0.5, -0.5].repeat(2880));
+        let resumed = render_stereo(&mut handler.ring.lock().unwrap(), 300);
+        assert_eq!(&resumed[598..], &[0.05, -0.05]);
+    }
+
+    #[test]
+    fn output_recovery_retries_after_device_is_temporarily_absent() {
+        let ring = Mutex::new(AudioRing::new(48000, 2));
+        let needs_rebuild = AtomicBool::new(true);
+        let mut stream = Some(1);
+        ring.lock().unwrap().push_samples(&[0.5, -0.5], 1.0);
+        assert_eq!(
+            recover_output(&mut stream, &needs_rebuild, &ring, || Err("no device")),
+            Err("no device")
+        );
+        assert!(stream.is_none());
+        assert!(needs_rebuild.load(Ordering::Acquire));
+        // Discard backlog accumulated while the device was unavailable, too.
+        ring.lock().unwrap().push_samples(&[1.0, 1.0], 1.0);
+        recover_output(&mut stream, &needs_rebuild, &ring, || Ok::<_, &str>(2)).unwrap();
+        assert_eq!(stream, Some(2));
+        assert!(ring.lock().unwrap().samples.is_empty());
+        assert!(!needs_rebuild.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn healthy_output_and_brief_underrun_keep_the_existing_stream() {
+        let ring = Mutex::new(AudioRing::new(48000, 2));
+        let needs_rebuild = AtomicBool::new(false);
+        let mut stream = Some(1);
+        ring.lock().unwrap().push_samples(&[0.5, -0.5], 1.0);
+        record_output_error(cpal::StreamError::BufferUnderrun, &needs_rebuild);
+        recover_output(&mut stream, &needs_rebuild, &ring, || -> Result<i32, ()> {
+            panic!("healthy output must not be reopened")
+        })
+        .unwrap();
+        assert_eq!(stream, Some(1));
+        assert_eq!(ring.lock().unwrap().samples.len(), 2);
+        record_output_error(cpal::StreamError::StreamInvalidated, &needs_rebuild);
+        assert!(needs_rebuild.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[ignore = "requires a real default system audio output device"]
+    fn real_audio_device_consumes_pcm_after_output_recovery() {
+        let device = cpal::default_host().default_output_device().unwrap();
+        let format = device.default_output_config().unwrap();
+        let config: cpal::StreamConfig = format.clone().into();
+        let ring = Arc::new(Mutex::new(AudioRing::new(
+            config.sample_rate as usize,
+            usize::from(config.channels),
+        )));
+        let handler = SystemAudioHandler {
+            ring: ring.clone(),
+            gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            output_channels: usize::from(config.channels),
+        };
+        let mut session = handler.audio_init(AudioFormat {
+            codec: shairplay::AudioCodec::Pcm,
+            bits: 32,
+            channels: u8::try_from(config.channels).unwrap(),
+            sample_rate: config.sample_rate,
+        });
+        let needs_rebuild = Arc::new(AtomicBool::new(false));
+        let stream = open_output_stream(
+            &device,
+            &config,
+            format.sample_format(),
+            ring.clone(),
+            needs_rebuild.clone(),
+        )
+        .unwrap();
+        let worker = OutputWorker::start(
+            stream,
+            config.clone(),
+            format.sample_format(),
+            ring.clone(),
+            needs_rebuild.clone(),
+        );
+        // Inject the same error reported by Windows, then reopen a real WASAPI
+        // stream. This does not unplug or change the user's output endpoint.
+        // One frame cannot reach prefill, so only recovery can clear it.
+        session.audio_process(&vec![0.0; usize::from(config.channels)]);
+        record_output_error(cpal::StreamError::DeviceNotAvailable, &needs_rebuild);
+        assert!(needs_rebuild.load(Ordering::Acquire));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !ring.lock().unwrap().samples.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not recover output"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let sample_count = ring.lock().unwrap().prefill_samples * 4;
+        // Silent PCM proves callbacks drain the existing AirPlay session
+        // without playing a test tone over the user's current media.
+        session.audio_process(&vec![0.0; sample_count]);
+        while !ring.lock().unwrap().playing {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reopened output did not start playback"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        while !ring.lock().unwrap().samples.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reopened output did not consume PCM"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!needs_rebuild.load(Ordering::Acquire));
+        drop(worker);
+    }
+
+    #[test]
     fn disabled_audio_does_not_delay_video() {
         assert_eq!(
             AudioOutputRuntime::disabled().buffer_delay(),
@@ -492,13 +766,12 @@ mod tests {
         let tail = render_stereo(&mut ring, 6);
         assert!(tail[0] > 0.0 && tail[0] < 0.5);
         assert!(tail.chunks_exact(2).all(|frame| frame[0] == -frame[1]));
-        assert!(
-            tail.chunks_exact(2)
-                .map(|frame| frame[0])
-                .collect::<Vec<_>>()
-                .windows(2)
-                .all(|pair| pair[0] >= pair[1])
-        );
+        assert!(tail
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|pair| pair[0] >= pair[1]));
         assert_eq!(&tail[10..], &[0.0, 0.0]);
     }
 
@@ -548,9 +821,7 @@ mod tests {
         session.audio_process(&[0.25, -0.5, 0.75, -1.0]);
         assert_eq!(
             drain(&handler),
-            [
-                0.25, -0.5, 0.0, 0.0, 0.0, 0.0, 0.75, -1.0, 0.0, 0.0, 0.0, 0.0
-            ]
+            [0.25, -0.5, 0.0, 0.0, 0.0, 0.0, 0.75, -1.0, 0.0, 0.0, 0.0, 0.0]
         );
     }
 
