@@ -30,6 +30,10 @@ There is no separate unit-test framework or test directory. `build.ps1 test` run
 
 Recent commits use short English imperative or fix-oriented subjects, without a strict prefix convention. Keep commits focused. Pull requests should explain the change, link a related issue when applicable, list affected architectures and the commands run, and include screenshots for visible UI changes. The build workflow runs for pull requests targeting `main` or `multi-arch`.
 
+## Upstream & Fork 政策
+
+所有 commit 與 push 只針對自己帳號的 fork（各倉庫遠端設定中的 `origin`）；`origin` 以外的遠端（如 `upstream`、`leapbtw`）一律視為唯讀，只 `fetch` 不推送。更新 `libuxplay` 子模組時，先在自己 fork 內完成 merge，再由主倉庫更新子模組指標。
+
 ## Security & Configuration
 
 Keep signing credentials in GitHub Actions secrets and out of source files. Avoid committing machine-specific paths or generated artifacts.
