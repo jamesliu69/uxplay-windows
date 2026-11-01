@@ -13,6 +13,21 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# 以 .NET API 計算 SHA256，避免 Windows PowerShell 在 PSModulePath 被外部覆寫的環境下載入不到內建模組 Get-FileHash。
+function Get-FileSha256Hex {
+    param([string]$Path)
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 if (-not $ProjectRoot) {
     $ProjectRoot = Split-Path -Parent $PSScriptRoot
 }
@@ -85,6 +100,49 @@ if (-not $msbuild) {
     )
 }
 
+# mDNSResponder 的 vcxproj 預設要求 v143（VS2022）工具集；機器只裝新版 VS 時會報 MSB8020。
+# 從 MSBuild.exe 所在的 VS 實例根目錄扫描實際安裝的工具集，用命令列屬性覆寫；
+# 有 v143 時仍優先用 v143，否則取編號最新的版本。
+function Get-VcPlatformToolset {
+    param([string]$MsBuildPath, [string]$Platform)
+
+    $current = $MsBuildPath
+    while ($current) {
+        $instanceRoot = Split-Path -Parent $current
+        $vcRoot = Join-Path $instanceRoot "MSBuild\Microsoft\VC"
+        if (Test-Path -LiteralPath $vcRoot) {
+            $toolsets = Get-ChildItem -Path $vcRoot -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Get-ChildItem `
+                        -Path (Join-Path $_.FullName "Platforms\$Platform\PlatformToolsets") `
+                        -Directory -ErrorAction SilentlyContinue
+                } |
+                ForEach-Object { $_.Name } |
+                Where-Object { $_ -match '^v\d+$' } |
+                Select-Object -Unique
+            if ($toolsets) {
+                if ($toolsets -contains 'v143') { return 'v143' }
+                return ($toolsets |
+                    Sort-Object -Property { [int]$_.Substring(1) } -Descending |
+                    Select-Object -First 1)
+            }
+            return $null
+        }
+        $current = $instanceRoot
+    }
+    return $null
+}
+
+$vcToolset = Get-VcPlatformToolset -MsBuildPath $msbuild -Platform $msbuildPlatform
+$toolsetArgs = @()
+if ($vcToolset) {
+    Write-Host "Building Bonjour with VC platform toolset $vcToolset."
+    $toolsetArgs = @("/p:PlatformToolset=$vcToolset")
+}
+else {
+    Write-Warning "Unable to detect an installed VC platform toolset; using the vcxproj default."
+}
+
 $architectureOutDir = Join-Path $ProjectRoot "out\$Architecture"
 $sourceDir = Join-Path $architectureOutDir "bonjour-source"
 if (Test-Path -LiteralPath $sourceDir) {
@@ -117,18 +175,33 @@ if ($LASTEXITCODE -ne 0) {
     throw "Unable to apply the mDNSResponder patch."
 }
 
-& $msbuild `
-    (Join-Path $sourceDir "mDNSWindows\DLL\dnssd.vcxproj") `
-    /m /t:Build /p:Configuration=Release /p:Platform=$msbuildPlatform
-if ($LASTEXITCODE -ne 0) {
-    throw "dnssd.dll build failed."
-}
+# mDNSResponder 原始碼在字串字面值內含 UTF-8 彎引號；非英文語系的 Windows 上 MSVC 會以
+# 本機字碼頁（如繁中 CP950）解讀而吞掉引號（C2001）。藉 CL 環境變數附加 /utf-8，
+# 僅作用於這兩次建置，結束後還原，不影響同一程序內後續的建置步驟。
+$previousClEnvironment = $env:CL
+$env:CL = ("$previousClEnvironment /utf-8").Trim()
+try {
+    & $msbuild `
+        (Join-Path $sourceDir "mDNSWindows\DLL\dnssd.vcxproj") `
+        /m /t:Build /p:Configuration=Release /p:Platform=$msbuildPlatform @toolsetArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "dnssd.dll build failed."
+    }
 
-& $msbuild `
-    (Join-Path $sourceDir "mDNSWindows\SystemService\mDNSResponder.vcxproj") `
-    /m /t:Build /p:Configuration=Release /p:Platform=$msbuildPlatform
-if ($LASTEXITCODE -ne 0) {
-    throw "mDNSResponder.exe build failed."
+    & $msbuild `
+        (Join-Path $sourceDir "mDNSWindows\SystemService\mDNSResponder.vcxproj") `
+        /m /t:Build /p:Configuration=Release /p:Platform=$msbuildPlatform @toolsetArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "mDNSResponder.exe build failed."
+    }
+}
+finally {
+    if ($null -ne $previousClEnvironment) {
+        $env:CL = $previousClEnvironment
+    }
+    else {
+        Remove-Item Env:CL -ErrorAction SilentlyContinue
+    }
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $sdk "Include") | Out-Null
@@ -170,10 +243,8 @@ $stamp = [ordered]@{
     tag = "rel/mDNSResponder-2881"
     architecture = $Architecture
     patchSha256 = (
-        Get-FileHash `
-            (Join-Path $ProjectRoot "mdnsresponder-patches\2881.patch") `
-            -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+        Get-FileSha256Hex (Join-Path $ProjectRoot "mdnsresponder-patches\2881.patch")
+    )
 }
 $stamp | ConvertTo-Json |
     Set-Content (Join-Path $sdk "build-info.json") -Encoding utf8
