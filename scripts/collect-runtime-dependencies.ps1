@@ -17,6 +17,21 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# 以 .NET API 計算 SHA256，避免 Windows PowerShell 在 PSModulePath 被外部覆寫的環境下載入不到內建模組 Get-FileHash。
+function Get-FileSha256Hex {
+    param([string]$Path)
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Get-RelativePath {
     param(
         [Parameter(Mandatory = $true)]
@@ -175,8 +190,7 @@ if (-not $ValidateOnly -and $ManifestPath) {
                 path = (Get-RelativePath -BasePath $stage -Path $_.FullName).
                     Replace("\", "/")
                 bytes = $_.Length
-                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.
-                    ToLowerInvariant()
+                sha256 = (Get-FileSha256Hex -Path $_.FullName)
             }
         }
 
