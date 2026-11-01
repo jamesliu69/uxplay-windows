@@ -72,6 +72,7 @@ public partial class MainWindow : Window
         try { AutostartHelper.SetEnabled(AutostartCheck.IsChecked == true); } catch { }
     }
 
+    /// <summary>建立系統匣（通知區）圖示與其右鍵選單、雙擊事件。</summary>
     private void SetupTray()
     {
         _tray = new Forms.NotifyIcon
@@ -81,7 +82,7 @@ public partial class MainWindow : Window
         };
         try
         {
-            _tray.Icon = System.Drawing.SystemIcons.Application;
+            _tray.Icon = CreateTrayIcon();
         }
         catch { }
         var menu = new Forms.ContextMenuStrip();
@@ -91,6 +92,27 @@ public partial class MainWindow : Window
         menu.Items.Add("Exit", null, (_, _) => ExitApp());
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (_, _) => ShowMainWindow();
+    }
+
+    /// <summary>
+    /// 載入內嵌的 UxPlayRs.Gui.ico 作為托盤圖示。
+    /// 該 ico 的所有影格皆為 PNG 壓縮格式，System.Drawing.Icon（GDI+）無法直接解碼，
+    /// 故改以 System.Drawing.Bitmap 讀取後縮放至托盤小圖示尺寸，再經 GetHicon 轉為圖示。
+    /// 任一步驟失敗時退回泛用應用程式圖示，確保托盤仍有可顯示的圖示。
+    /// </summary>
+    private static System.Drawing.Icon CreateTrayIcon()
+    {
+        var resource = System.Windows.Application.GetResourceStream(
+            new Uri("pack://application:,,,/UxPlayRs.Gui;component/Assets/UxPlayRs.Gui.ico"));
+        if (resource is null)
+        {
+            return System.Drawing.SystemIcons.Application;
+        }
+        using var stream = resource.Stream;
+        using var source = new System.Drawing.Bitmap(stream);
+        var size = Forms.SystemInformation.SmallIconSize;
+        using var scaled = new System.Drawing.Bitmap(source, size);
+        return System.Drawing.Icon.FromHandle(scaled.GetHicon());
     }
 
     private void ShowMainWindow()
