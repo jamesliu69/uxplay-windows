@@ -16,80 +16,87 @@ const PREFILL_BUFFER_MILLIS: usize = 60;
 const TRANSITION_MILLIS: usize = 5;
 const OUTPUT_RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 開啟輸出裝置前 ring 暫用的取樣率；僅影響等待期間的緩衝尺寸，
+/// 實際裝置開啟成功時會以 reconfigure 改成協商格式。
+const PENDING_SAMPLE_RATE: usize = 48_000;
+
+/// 與 shairplay 協商、供後續所有（重新）開啟沿用的輸出格式。PCM 進到
+/// ring 的速率在接收器生命週期內固定不變（resample 在 shairplay 端），
+/// 裝置切換時只能以同一格式重開，由 Windows WASAPI shared mode 轉換成
+/// 新裝置的 mix format，不能改用新裝置自己的格式。
+#[derive(Clone)]
+struct NegotiatedFormat {
+    config: cpal::StreamConfig,
+    sample_format: SampleFormat,
+}
+
+/// 目前是否已有可用的 OS 輸出串流；None 表示仍在等待裝置出現。
+struct OpenedOutput {
+    /// 保存中的裝置串流；值本身不被讀取，但必須存活到被替換為止
+    /// （drop 即停止輸出），因此保留欄位並允許未讀取。
+    #[allow(dead_code)]
+    stream: cpal::Stream,
+    /// 開串流時使用的取樣率；用於偵測 AirPlay PCM 速率變動。
+    sample_rate: u32,
+    /// 串流所在裝置的識別（DeviceId 或裝置名）；用於偵測預設裝置被切換。
+    device_key: String,
+}
+
 /// Keeps the OS audio stream alive and exposes the handler used by shairplay.
 pub struct AudioOutputRuntime {
     handler: Arc<SystemAudioHandler>,
-    _output_worker: Option<OutputWorker>,
+    _output_worker: OutputWorker,
     sample_rate: Option<u32>,
     channels: Option<u8>,
 }
 
 impl AudioOutputRuntime {
     pub fn start() -> Self {
-        let host = cpal::default_host();
-        let Some(device) = host.default_output_device() else {
-            warn!("No default audio output device; AirPlay audio will be discarded");
-            return Self::disabled();
-        };
+        // 裝置可能隨時熱插入，開啟失敗不再永久停用音訊：ring 先以暫用
+        // 格式建立，OutputWorker 會持續重試，成功後把 ring 重設為協商
+        // 格式。session 的聲道映射在每次收包時讀 ring 現值，因此
+        // reconfigure 之後新舊 session 都能對上目前的輸出裝置。
+        let ring = Arc::new(Mutex::new(AudioRing::new(PENDING_SAMPLE_RATE, 2)));
+        let negotiated = default_device_format();
+        // 尚沒有 AirPlay session 時，PCM 速率以預設裝置（或暫用值）為準；
+        // 第一個 session 建立後 worker 會自動對齊其宣布的速率。
+        let pcm_rate = Arc::new(AtomicU32::new(
+            negotiated
+                .as_ref()
+                .map(|format| format.config.sample_rate)
+                .unwrap_or(PENDING_SAMPLE_RATE as u32),
+        ));
+        let handler = Arc::new(SystemAudioHandler {
+            ring: ring.clone(),
+            gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            pcm_rate: pcm_rate.clone(),
+        });
+        let needs_rebuild = Arc::new(AtomicBool::new(true));
 
-        let config = match device.default_output_config() {
-            Ok(config) => config,
-            Err(error) => {
-                warn!(%error, "Could not query the default audio output format; AirPlay audio will be discarded");
-                return Self::disabled();
-            }
-        };
+        // 第一次開啟成功時固定協商格式：shairplay 之後供給的 PCM 速率
+        // 與聲道即以此為準，裝置熱插入／切換都沿用同一份。
+        let opened = negotiated
+            .as_ref()
+            .and_then(|format| {
+                open_output_on_default(format, default_device(), &ring, &needs_rebuild).ok()
+            });
+        let sample_rate = negotiated.as_ref().map(|format| format.config.sample_rate);
+        let channels = negotiated
+            .as_ref()
+            .and_then(|format| u8::try_from(format.config.channels).ok());
 
-        let sample_rate = config.sample_rate();
-        let channels = config.channels();
-        let ring = Arc::new(Mutex::new(AudioRing::new(
-            sample_rate as usize,
-            usize::from(channels),
-        )));
-        let stream_config: cpal::StreamConfig = config.clone().into();
-        let needs_rebuild = Arc::new(AtomicBool::new(false));
-        let stream = match open_output_stream(
-            &device,
-            &stream_config,
-            config.sample_format(),
-            ring.clone(),
-            needs_rebuild.clone(),
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                warn!(%error, "Could not start the default audio output device; AirPlay audio will be discarded");
-                return Self::disabled();
-            }
-        };
-
-        let device_name = device
-            .description()
-            .map(|description| description.name().to_string())
-            .unwrap_or_else(|_| "default output".to_string());
-        info!(
-            device = %device_name,
-            sample_rate,
-            channels,
-            prefill_ms = PREFILL_BUFFER_MILLIS,
-            "System audio output ready"
-        );
-
-        let output_worker = OutputWorker::start(
-            stream,
-            stream_config,
-            config.sample_format(),
-            ring.clone(),
+        let _output_worker = OutputWorker::start(
+            opened,
+            negotiated,
+            ring,
             needs_rebuild,
+            pcm_rate,
         );
         Self {
-            handler: Arc::new(SystemAudioHandler {
-                ring,
-                gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
-                output_channels: usize::from(channels),
-            }),
-            _output_worker: Some(output_worker),
-            sample_rate: Some(sample_rate),
-            channels: u8::try_from(channels).ok(),
+            handler,
+            _output_worker,
+            sample_rate,
+            channels,
         }
     }
 
@@ -108,24 +115,17 @@ impl AudioOutputRuntime {
     /// Added software buffering to compensate on the video presentation path.
     /// Device/transport latency is separate; disabled audio needs no holdback.
     pub fn buffer_delay(&self) -> Duration {
-        if self.sample_rate.is_some() {
-            Duration::from_millis(PREFILL_BUFFER_MILLIS as u64)
-        } else {
-            Duration::ZERO
-        }
+        buffer_delay_for(self.sample_rate)
     }
+}
 
-    fn disabled() -> Self {
-        Self {
-            handler: Arc::new(SystemAudioHandler {
-                ring: Arc::new(Mutex::new(AudioRing::new(1, 2))),
-                gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
-                output_channels: 2,
-            }),
-            _output_worker: None,
-            sample_rate: None,
-            channels: None,
-        }
+/// 依「目前是否已有輸出裝置」計算影片端的音訊緩衝補償；尚未有裝置
+/// 時不補償，避免影片白白延遲。
+fn buffer_delay_for(sample_rate: Option<u32>) -> Duration {
+    if sample_rate.is_some() {
+        Duration::from_millis(PREFILL_BUFFER_MILLIS as u64)
+    } else {
+        Duration::ZERO
     }
 }
 
@@ -138,54 +138,81 @@ struct OutputWorker {
 
 impl OutputWorker {
     fn start(
-        stream: cpal::Stream,
-        config: cpal::StreamConfig,
-        sample_format: SampleFormat,
+        opened: Option<OpenedOutput>,
+        negotiated: Option<NegotiatedFormat>,
         ring: Arc<Mutex<AudioRing>>,
         needs_rebuild: Arc<AtomicBool>,
+        pcm_rate: Arc<AtomicU32>,
     ) -> Self {
         let (shutdown, receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let mut stream = Some(stream);
+            let mut opened = opened;
+            // 尚未固定協商格式（啟動時沒有裝置）時，每次成功開啟的
+            // 裝置格式會成為之後沿用的對象；固定之後裝置切換一律以
+            // 同一格式重開，僅取樣率跟隨 AirPlay PCM 實際供給速率。
+            let mut negotiated = negotiated;
             let mut failed_attempts = 0_u64;
             while matches!(
                 receiver.recv_timeout(OUTPUT_RECOVERY_INTERVAL),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
-                let result = recover_output(&mut stream, &needs_rebuild, &ring, || {
-                    let device = cpal::default_host()
-                        .default_output_device()
-                        .ok_or_else(|| anyhow::anyhow!("No default audio output device"))?;
-                    // Keep the format negotiated with shairplay. Windows WASAPI
-                    // shared mode converts it to the replacement endpoint's mix
-                    // format, even when its native rate/channel count differs.
-                    let stream = open_output_stream(
-                        &device,
-                        &config,
-                        sample_format,
-                        ring.clone(),
-                        needs_rebuild.clone(),
-                    )?;
-                    let device_name = device
-                        .description()
-                        .map(|description| description.name().to_string())
-                        .unwrap_or_else(|_| "default output".to_string());
-                    info!(
-                        device = %device_name,
-                        sample_rate = config.sample_rate,
-                        channels = config.channels,
-                        "System audio output recovered"
+                let current_device = default_device();
+                if negotiated.is_none() {
+                    negotiated = default_device_format();
+                }
+                let Some(base) = negotiated.clone() else {
+                    needs_rebuild.store(true, Ordering::Release);
+                    failed_attempts = throttle_retry(
+                        failed_attempts,
+                        "no default audio output device yet",
                     );
-                    Ok::<_, anyhow::Error>(stream)
-                });
-                if let Err(error) = result {
-                    // Retry while unplugged, without flooding the GUI log.
-                    if failed_attempts % 20 == 0 {
-                        warn!(%error, "Could not reopen audio output; retrying automatically");
-                    }
-                    failed_attempts = failed_attempts.wrapping_add(1);
-                } else {
+                    continue;
+                };
+                let target = align_sample_rate(&base, pcm_rate.load(Ordering::Acquire));
+                let refresh = refresh_reason(
+                    opened.as_ref().map(|opened| opened.device_key.as_str()),
+                    current_device.as_ref().and_then(device_key).as_deref(),
+                    opened
+                        .as_ref()
+                        .is_some_and(|opened| opened.sample_rate != target.config.sample_rate),
+                    &needs_rebuild,
+                );
+                if refresh == RefreshReason::None {
                     failed_attempts = 0;
+                    continue;
+                }
+                // 純速率對齊不丟棄待播 PCM：先以目標速率重算 ring 計時；
+                // 之後 open_output_on_default 成功時會做完整的 reconfigure。
+                if refresh == RefreshReason::RateRealigned {
+                    if let Ok(mut ring_guard) = ring.lock() {
+                        ring_guard.retune_rate(target.config.sample_rate as usize);
+                    }
+                }
+                let result = recover_output(&mut opened, || {
+                    open_output_on_default(&target, current_device.clone(), &ring, &needs_rebuild)
+                });
+                match result {
+                    Ok(()) => {
+                        failed_attempts = 0;
+                        match refresh {
+                            RefreshReason::DeviceChanged => {
+                                info!("Default audio output device changed; stream moved");
+                            }
+                            RefreshReason::RateRealigned => {
+                                info!(
+                                    sample_rate = target.config.sample_rate,
+                                    "Output sample rate realigned to the AirPlay stream"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(error) => {
+                        failed_attempts = throttle_retry(
+                            failed_attempts,
+                            &format!("could not reopen audio output: {error}"),
+                        );
+                    }
                 }
             }
         });
@@ -194,6 +221,164 @@ impl OutputWorker {
             thread: Some(thread),
         }
     }
+}
+
+/// 把協商格式的取樣率換成 AirPlay PCM 實際速率；聲道數與取樣格式沿用
+/// 裝置值。WASAPI shared mode 會把此格式轉換成裝置的 mix format，
+/// 因此串流速率對齊 PCM 供給速率即可，不需要在應用層重取樣。
+fn align_sample_rate(base: &NegotiatedFormat, pcm_rate: u32) -> NegotiatedFormat {
+    NegotiatedFormat {
+        config: cpal::StreamConfig {
+            channels: base.config.channels,
+            buffer_size: base.config.buffer_size,
+            sample_rate: pcm_rate,
+        },
+        sample_format: base.sample_format,
+    }
+}
+
+/// 裝置缺席期間的節流重試記錄：每 20 次失敗（約 10 秒）回報一次，
+/// 避免洗版 GUI 記錄，並回傳遞增後的失敗次數。
+fn throttle_retry(failed_attempts: u64, message: &str) -> u64 {
+    if failed_attempts.is_multiple_of(20) {
+        warn!("{message}; retrying automatically");
+    }
+    failed_attempts.wrapping_add(1)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshReason {
+    /// 串流運作中、速率已對齊、預設裝置也未變：不需要任何動作。
+    None,
+    /// 預設裝置被切換：把串流搬到新裝置上繼續播。
+    DeviceChanged,
+    /// AirPlay session 宣布的 PCM 速率與串流不同：以新速率重開串流，
+    /// 避免 ring 消耗速率與 PCM 供給速率長期失配。
+    RateRealigned,
+    /// needs_rebuild 已被串流錯誤或初始失敗設定：需要（重新）開啟。
+    Rebuild,
+}
+
+/// 決定這個週期要不要重建輸出串流。優先順序：串流錯誤（Rebuild）>
+/// 速率失配（RateRealigned）> 預設裝置切換（DeviceChanged）。裝置識別
+/// 任一無法取得時保守地不切換裝置。
+fn refresh_reason(
+    current: Option<&str>,
+    default: Option<&str>,
+    rate_realigned_needed: bool,
+    needs_rebuild: &AtomicBool,
+) -> RefreshReason {
+    if needs_rebuild.load(Ordering::Acquire) {
+        return RefreshReason::Rebuild;
+    }
+    if rate_realigned_needed {
+        return RefreshReason::RateRealigned;
+    }
+    let Some(current) = current else {
+        return RefreshReason::None;
+    };
+    match default {
+        Some(default) if default != current => RefreshReason::DeviceChanged,
+        _ => RefreshReason::None,
+    }
+}
+
+/// 目前系統預設輸出裝置；連續兩次查詢到不同裝置時回 None，代表預設
+/// 裝置正在切換，這個週期不開串流。
+fn default_device() -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    let first = host.default_output_device()?;
+    let second = host.default_output_device()?;
+    (device_key(&first)? == device_key(&second)?).then_some(second)
+}
+
+/// 預設輸出裝置的格式；連續兩次查詢一致才回傳，避免在裝置切換瞬間
+/// 讀到新舊交錯的資訊。
+fn default_device_format() -> Option<NegotiatedFormat> {
+    let device = default_device()?;
+    let first = device.default_output_config().ok()?;
+    let second = device.default_output_config().ok()?;
+    if first.sample_rate() != second.sample_rate()
+        || first.channels() != second.channels()
+        || first.sample_format() != second.sample_format()
+    {
+        return None;
+    }
+    Some(NegotiatedFormat {
+        config: second.clone().into(),
+        sample_format: second.sample_format(),
+    })
+}
+
+/// 裝置的穩定識別字串；DeviceId 在應用程式重啟間保持穩定，適合偵測
+/// 「Windows 預設輸出裝置被使用者切換」，無法取得時退回裝置名稱。
+fn device_key(device: &cpal::Device) -> Option<String> {
+    device
+        .id()
+        .map(|id| id.to_string())
+        .ok()
+        .or_else(|| device.description().map(|d| d.name().to_string()).ok())
+}
+
+/// 以固定的協商格式在指定裝置上開啟輸出串流，並把 ring 重設為該格式。
+/// 成功時清除 needs_rebuild；任何失敗都設為 true，讓 OutputWorker 之後
+/// 持續重試，音訊不會因為啟動當下沒有裝置而被永久丟棄。
+fn open_output_on_default(
+    format: &NegotiatedFormat,
+    device: Option<cpal::Device>,
+    ring: &Arc<Mutex<AudioRing>>,
+    needs_rebuild: &Arc<AtomicBool>,
+) -> anyhow::Result<OpenedOutput> {
+    let result = open_output_on_default_inner(format, device, ring, needs_rebuild);
+    needs_rebuild.store(result.is_err(), Ordering::Release);
+    result
+}
+
+fn open_output_on_default_inner(
+    format: &NegotiatedFormat,
+    device: Option<cpal::Device>,
+    ring: &Arc<Mutex<AudioRing>>,
+    needs_rebuild: &Arc<AtomicBool>,
+) -> anyhow::Result<OpenedOutput> {
+    let device = device
+        .or_else(default_device)
+        .ok_or_else(|| anyhow::anyhow!("no default audio output device"))?;
+    let device_key = device_key(&device)
+        .ok_or_else(|| anyhow::anyhow!("default audio output device has no stable id"))?;
+
+    let stream = open_output_stream(
+        &device,
+        &format.config,
+        format.sample_format,
+        ring.clone(),
+        needs_rebuild.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("could not start the default audio output device: {error}"))?;
+
+    // 串流實際開起來之後，才把 ring 換成協商的取樣率／聲道數。
+    // reconfigure 會清空蓄積的 PCM，並保留 session id。
+    if let Ok(mut ring) = ring.lock() {
+        ring.reconfigure(
+            format.config.sample_rate as usize,
+            usize::from(format.config.channels),
+        );
+    }
+    let device_name = device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| "default output".to_string());
+    info!(
+        device = %device_name,
+        sample_rate = format.config.sample_rate,
+        channels = format.config.channels,
+        prefill_ms = PREFILL_BUFFER_MILLIS,
+        "System audio output ready"
+    );
+    Ok(OpenedOutput {
+        stream,
+        sample_rate: format.config.sample_rate,
+        device_key,
+    })
 }
 
 impl Drop for OutputWorker {
@@ -263,27 +448,18 @@ fn record_output_error(error: cpal::StreamError, needs_rebuild: &AtomicBool) {
 }
 
 fn recover_output<S, E>(
-    stream: &mut Option<S>,
-    needs_rebuild: &AtomicBool,
-    ring: &Mutex<AudioRing>,
+    opened: &mut Option<S>,
     open: impl FnOnce() -> Result<S, E>,
 ) -> Result<(), E> {
-    if !needs_rebuild.swap(false, Ordering::AcqRel) {
-        return Ok(());
-    }
-    drop(stream.take());
-    if let Ok(mut ring) = ring.lock() {
-        ring.clear();
-    }
+    // 先丟棄舊串流再開新的；ring 的清空與格式重設由 open_default_output
+    // 成功時的 reconfigure 完成（舊 PCM 的取樣率／聲道已不適用新裝置）。
+    drop(opened.take());
     match open() {
         Ok(replacement) => {
-            *stream = Some(replacement);
+            *opened = Some(replacement);
             Ok(())
         }
-        Err(error) => {
-            needs_rebuild.store(true, Ordering::Release);
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -321,6 +497,27 @@ impl AudioRing {
             last_frame: vec![0.0; channels],
             session_id: 0,
         }
+    }
+
+    /// 依 PCM 實際速率調整緩衝計時（容量/prefill 以毫秒換算）；不清空、
+    /// 不改聲道數、不動 session id。緩衝內樣本按 frame 計數，速率變化
+    /// 只改變每毫秒消耗的樣本數，不需丟棄已排入的 PCM。
+    fn retune_rate(&mut self, sample_rate: usize) {
+        self.max_samples = (sample_rate * MAX_BUFFER_MILLIS / 1000).max(1) * self.channels;
+        self.prefill_samples = (sample_rate * PREFILL_BUFFER_MILLIS)
+            .div_ceil(1000)
+            .max(1)
+            .saturating_mul(self.channels)
+            .min(self.max_samples);
+        self.transition_frames = (sample_rate * TRANSITION_MILLIS / 1000).max(1);
+    }
+
+    fn reconfigure(&mut self, sample_rate: usize, channels: usize) {
+        let session_id = self.session_id;
+        *self = AudioRing::new(sample_rate, channels);
+        // 換輸出裝置屬於同一條 AirPlay 連線的延續；保留 session id，
+        // 讓重新協商前的舊 session 封包仍照常被丟棄。
+        self.session_id = session_id;
     }
 
     fn push_samples(&mut self, input: &[f32], gain: f32) {
@@ -410,7 +607,9 @@ impl AudioRing {
 struct SystemAudioHandler {
     ring: Arc<Mutex<AudioRing>>,
     gain_bits: Arc<AtomicU32>,
-    output_channels: usize,
+    /// 最近一次 AirPlay session 宣布的 PCM 取樣率（Hz）。worker 據此把
+    /// 串流取樣率對齊 PCM 供給速率，避免 ring 消耗與供給長期失配。
+    pcm_rate: Arc<AtomicU32>,
 }
 
 impl AudioHandler for SystemAudioHandler {
@@ -422,6 +621,9 @@ impl AudioHandler for SystemAudioHandler {
         } else {
             0
         };
+        // 記下 shairplay 實際供給的 PCM 速率；裝置串流的速率對齊由
+        // OutputWorker 背景處理，收包路徑不做任何裝置操作。
+        self.pcm_rate.store(format.sample_rate, Ordering::Release);
         info!(
             sample_rate = format.sample_rate,
             channels = format.channels,
@@ -432,7 +634,6 @@ impl AudioHandler for SystemAudioHandler {
             ring: self.ring.clone(),
             gain_bits: self.gain_bits.clone(),
             source_channels: usize::from(format.channels),
-            output_channels: self.output_channels,
             session_id,
         })
     }
@@ -463,34 +664,36 @@ struct SystemAudioSession {
     ring: Arc<Mutex<AudioRing>>,
     gain_bits: Arc<AtomicU32>,
     source_channels: usize,
-    output_channels: usize,
     session_id: u64,
 }
 
 impl AudioSession for SystemAudioSession {
     fn audio_process(&mut self, samples: &[f32]) {
-        if self.source_channels == 0 || self.output_channels == 0 {
-            return;
-        }
         let gain = f32::from_bits(self.gain_bits.load(Ordering::Acquire));
         if let Ok(mut ring) = self.ring.lock() {
             if ring.session_id != self.session_id {
                 return;
             }
-            if self.source_channels == self.output_channels {
+            // 輸出聲道數在裝置熱插入／切換時會變動，不能沿用建立 session
+            // 當下的快取，需以 ring 現值做單／多聲道映射。
+            let output_channels = ring.channels;
+            if self.source_channels == 0 || output_channels == 0 {
+                return;
+            }
+            if self.source_channels == output_channels {
                 let complete = samples.len() / self.source_channels * self.source_channels;
                 ring.push_samples(&samples[..complete], gain);
             } else {
-                let mut output = vec![0.0; self.output_channels];
+                let mut output = vec![0.0; output_channels];
                 for frame in samples.chunks_exact(self.source_channels) {
                     output.fill(0.0);
-                    if self.output_channels == 1 {
+                    if output_channels == 1 {
                         output[0] = frame.iter().sum::<f32>() / self.source_channels as f32;
                     } else if self.source_channels == 1 {
                         output[0] = frame[0];
                         output[1] = frame[0];
                     } else {
-                        let shared = self.source_channels.min(self.output_channels);
+                        let shared = self.source_channels.min(output_channels);
                         output[..shared].copy_from_slice(&frame[..shared]);
                     }
                     ring.push_samples(&output, gain);
@@ -522,7 +725,7 @@ mod tests {
         SystemAudioHandler {
             ring: Arc::new(Mutex::new(AudioRing::new(48000, output_channels))),
             gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
-            output_channels,
+            pcm_rate: Arc::new(AtomicU32::new(48_000)),
         }
     }
 
@@ -559,19 +762,21 @@ mod tests {
         session.audio_process(&[1.0, -1.0].repeat(2880));
         let old_dropped = Arc::new(AtomicBool::new(false));
         let mut stream = Some(DeviceStream(old_dropped.clone()));
-        let needs_rebuild = AtomicBool::new(false);
 
-        record_output_error(cpal::StreamError::DeviceNotAvailable, &needs_rebuild);
-        assert!(needs_rebuild.load(Ordering::Acquire));
-        recover_output(&mut stream, &needs_rebuild, &handler.ring, || {
+        // 模擬裝置失效後 worker 的重建路徑：丟棄舊串流、重設 ring 格式
+        // （清空蓄積 PCM、保留 session id），再以新串流繼續。
+        handler
+            .ring
+            .lock()
+            .unwrap()
+            .reconfigure(48000, 2);
+        recover_output(&mut stream, || {
             assert!(old_dropped.load(Ordering::Acquire));
-            assert!(handler.ring.lock().unwrap().samples.is_empty());
             Ok::<_, ()>(DeviceStream(Arc::new(AtomicBool::new(false))))
         })
         .unwrap();
         assert!(old_dropped.load(Ordering::Acquire));
         assert!(stream.is_some());
-        assert!(!needs_rebuild.load(Ordering::Acquire));
         let mut ring = handler.ring.lock().unwrap();
         assert_eq!(render_stereo(&mut ring, 10), vec![0.0; 20]);
         drop(ring);
@@ -584,77 +789,152 @@ mod tests {
 
     #[test]
     fn output_recovery_retries_after_device_is_temporarily_absent() {
-        let ring = Mutex::new(AudioRing::new(48000, 2));
-        let needs_rebuild = AtomicBool::new(true);
         let mut stream = Some(1);
-        ring.lock().unwrap().push_samples(&[0.5, -0.5], 1.0);
         assert_eq!(
-            recover_output(&mut stream, &needs_rebuild, &ring, || Err("no device")),
+            recover_output(&mut stream, || Err("no device")),
             Err("no device")
         );
         assert!(stream.is_none());
-        assert!(needs_rebuild.load(Ordering::Acquire));
-        // Discard backlog accumulated while the device was unavailable, too.
-        ring.lock().unwrap().push_samples(&[1.0, 1.0], 1.0);
-        recover_output(&mut stream, &needs_rebuild, &ring, || Ok::<_, &str>(2)).unwrap();
+        // 裝置缺席期間蓄積的 backlog 由成功路徑的 reconfigure 清空。
+        recover_output(&mut stream, || Ok::<_, &str>(2)).unwrap();
         assert_eq!(stream, Some(2));
-        assert!(ring.lock().unwrap().samples.is_empty());
-        assert!(!needs_rebuild.load(Ordering::Acquire));
     }
 
     #[test]
     fn healthy_output_and_brief_underrun_keep_the_existing_stream() {
-        let ring = Mutex::new(AudioRing::new(48000, 2));
         let needs_rebuild = AtomicBool::new(false);
-        let mut stream = Some(1);
-        ring.lock().unwrap().push_samples(&[0.5, -0.5], 1.0);
         record_output_error(cpal::StreamError::BufferUnderrun, &needs_rebuild);
-        recover_output(&mut stream, &needs_rebuild, &ring, || -> Result<i32, ()> {
-            panic!("healthy output must not be reopened")
-        })
-        .unwrap();
-        assert_eq!(stream, Some(1));
-        assert_eq!(ring.lock().unwrap().samples.len(), 2);
+        assert!(!needs_rebuild.load(Ordering::Acquire));
         record_output_error(cpal::StreamError::StreamInvalidated, &needs_rebuild);
         assert!(needs_rebuild.load(Ordering::Acquire));
     }
 
     #[test]
+    fn refresh_reason_orders_rebuild_then_rate_then_device_change() {
+        let needs_rebuild = AtomicBool::new(true);
+        assert_eq!(
+            refresh_reason(None, Some("wasapi:a"), true, &needs_rebuild),
+            RefreshReason::Rebuild
+        );
+        needs_rebuild.store(false, Ordering::Release);
+        assert_eq!(
+            refresh_reason(Some("wasapi:a"), Some("wasapi:a"), false, &needs_rebuild),
+            RefreshReason::None
+        );
+        // 速率失配優先於裝置切換：兩者都會重建串流，但速率對齊先做。
+        assert_eq!(
+            refresh_reason(Some("wasapi:a"), Some("wasapi:b"), true, &needs_rebuild),
+            RefreshReason::RateRealigned
+        );
+        assert_eq!(
+            refresh_reason(Some("wasapi:a"), Some("wasapi:b"), false, &needs_rebuild),
+            RefreshReason::DeviceChanged
+        );
+        // 任一識別無法取得時保守不切換。
+        assert_eq!(
+            refresh_reason(Some("wasapi:a"), None, false, &needs_rebuild),
+            RefreshReason::None
+        );
+        assert_eq!(
+            refresh_reason(None, Some("wasapi:a"), false, &needs_rebuild),
+            RefreshReason::None
+        );
+    }
+
+    #[test]
+    fn align_sample_rate_follows_pcm_and_keeps_device_channels() {
+        let base = NegotiatedFormat {
+            config: cpal::StreamConfig {
+                channels: 2,
+                buffer_size: cpal::BufferSize::Default,
+                sample_rate: 48_000,
+            },
+            sample_format: SampleFormat::F32,
+        };
+        let aligned = align_sample_rate(&base, 44_100);
+        assert_eq!(aligned.config.sample_rate, 44_100);
+        assert_eq!(aligned.config.channels, 2);
+        assert_eq!(aligned.sample_format, SampleFormat::F32);
+    }
+
+    #[test]
+    fn retune_rate_resizes_timing_without_clearing_pending_samples() {
+        let mut ring = AudioRing::new(48_000, 2);
+        ring.push_samples(&[0.5, -0.5].repeat(480), 1.0); // 10 ms
+        ring.retune_rate(96_000);
+        assert_eq!(ring.channels, 2);
+        assert_eq!(ring.samples.len(), 960);
+        // 容量與 prefill 依新速率重算。
+        assert_eq!(ring.max_samples, 96_000 * MAX_BUFFER_MILLIS / 1000 * 2);
+        assert_eq!(
+            ring.prefill_samples,
+            96_000 * PREFILL_BUFFER_MILLIS / 1000 * 2
+        );
+    }
+
+    #[test]
+    fn reconfigure_resizes_buffer_keeps_session_id_and_clears_backlog() {
+        let handler = handler(2);
+        let mut session = handler.audio_init(format(2));
+        session.audio_process(&[0.25, -0.5].repeat(3600)); // 1.8 s @48k
+        {
+            let mut ring = handler.ring.lock().unwrap();
+            assert!(!ring.samples.is_empty());
+            ring.reconfigure(44_100, 6);
+            assert_eq!(ring.channels, 6);
+            assert_eq!(ring.max_samples, 44_100 * MAX_BUFFER_MILLIS / 1000 * 6);
+            assert!(ring.samples.is_empty());
+        }
+        // 同一 session 的封包仍被接受，並依新聲道數（6）映射。
+        session.audio_process(&[0.5, -0.5, 0.5, -0.5]);
+        assert_eq!(
+            drain(&handler),
+            [0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0]
+        );
+        // reconfigure 保留 session id：換新 session 後，舊 session 的封包
+        // 仍照常被拒絕，不會因為格式重設而復活。
+        let mut stale = session;
+        let mut _current = handler.audio_init(format(2));
+        assert!(drain(&handler).is_empty());
+        stale.audio_process(&[1.0, 1.0]);
+        assert!(drain(&handler).is_empty());
+    }
+
+    #[test]
     #[ignore = "requires a real default system audio output device"]
     fn real_audio_device_consumes_pcm_after_output_recovery() {
-        let device = cpal::default_host().default_output_device().unwrap();
-        let format = device.default_output_config().unwrap();
-        let config: cpal::StreamConfig = format.clone().into();
-        let ring = Arc::new(Mutex::new(AudioRing::new(
-            config.sample_rate as usize,
-            usize::from(config.channels),
-        )));
+        let ring = Arc::new(Mutex::new(AudioRing::new(PENDING_SAMPLE_RATE, 2)));
+        let pcm_rate = Arc::new(AtomicU32::new(PENDING_SAMPLE_RATE as u32));
         let handler = SystemAudioHandler {
             ring: ring.clone(),
             gain_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
-            output_channels: usize::from(config.channels),
+            pcm_rate: pcm_rate.clone(),
         };
         let mut session = handler.audio_init(AudioFormat {
             codec: shairplay::AudioCodec::Pcm,
             bits: 32,
-            channels: u8::try_from(config.channels).unwrap(),
-            sample_rate: config.sample_rate,
+            channels: 2,
+            sample_rate: 48_000,
         });
-        let needs_rebuild = Arc::new(AtomicBool::new(false));
-        let stream = open_output_stream(
-            &device,
-            &config,
-            format.sample_format(),
-            ring.clone(),
-            needs_rebuild.clone(),
+        let needs_rebuild = Arc::new(AtomicBool::new(true));
+        // 以正式的開啟路徑（含 ring reconfigure）取得串流，再交給 worker。
+        let negotiated = default_device_format().unwrap();
+        let opened = open_output_on_default(
+            &negotiated,
+            default_device(),
+            &ring,
+            &needs_rebuild,
         )
         .unwrap();
+        let config = negotiated.config.clone();
+        assert!(!needs_rebuild.load(Ordering::Acquire));
+        assert_eq!(ring.lock().unwrap().channels, usize::from(config.channels));
         let worker = OutputWorker::start(
-            stream,
-            config.clone(),
-            format.sample_format(),
+            Some(opened),
+            Some(negotiated),
             ring.clone(),
             needs_rebuild.clone(),
+            pcm_rate,
         );
         // Inject the same error reported by Windows, then reopen a real WASAPI
         // stream. This does not unplug or change the user's output endpoint.
@@ -693,10 +973,11 @@ mod tests {
     }
 
     #[test]
-    fn disabled_audio_does_not_delay_video() {
+    fn audio_without_a_device_does_not_delay_video() {
+        assert_eq!(buffer_delay_for(None), Duration::ZERO);
         assert_eq!(
-            AudioOutputRuntime::disabled().buffer_delay(),
-            Duration::ZERO
+            buffer_delay_for(Some(48_000)),
+            Duration::from_millis(PREFILL_BUFFER_MILLIS as u64)
         );
     }
 

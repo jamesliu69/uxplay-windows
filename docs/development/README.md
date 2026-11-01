@@ -4,6 +4,7 @@
 
 | 日期 | 紀錄 | 查詢關鍵字 |
 |---|---|---|
+| 2026-11-01 | [UxPlayRs 音訊輸出熱恢復與預設裝置跟隨](2026-11-01-uxplay-rs-audio-output-recovery.md) | 無聲、音訊、熱插入、預設裝置、WASAPI、cpal、AudioRing、reconfigure、DeviceId |
 | 2026-10-09 | [UxPlayRs 重寫、播放修正與安裝打包完整紀錄](2026-10-09-uxplay-rs-development-history.md) | C#、Rust、播放尺寸、停格、lag、無聲、AAC-ELD、色塊、重影、OpenH264、FFmpeg、MSI、WindowsBuild、9600、26300、1925 |
 
 相關文件：
