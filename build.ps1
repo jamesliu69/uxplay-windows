@@ -1,4 +1,4 @@
-<# Single entry point for preparing, building, packaging, and testing x64 and ARM64.
+﻿<# Single entry point for preparing, building, packaging, and testing x64 and ARM64.
    Produces the portable bundle and MSI through the same workflow locally and in CI. #>
 [CmdletBinding()]
 param(
@@ -44,6 +44,90 @@ $architectureConfig = if ($Architecture -eq "arm64") {
     }
 }
 $environmentName = $architectureConfig.EnvironmentName
+
+function Test-Msys2Installation {
+    param([string]$Root)
+    return (Test-Path -LiteralPath (Join-Path $Root "usr\bin\pacman.exe") -PathType Leaf)
+}
+
+# 依常見安裝位置搜尋現有的 MSYS2；找到時改寫 $MsysRoot，
+# 讓未安裝在預設路徑（C:\msys64）的機器不必另傳參數即可建置。
+function Resolve-Msys2Installation {
+    $candidates = @(
+        $MsysRoot,
+        (Join-Path $env:ProgramFiles "MSYS2"),
+        "C:\msys64",
+        "D:\msys64",
+        "C:\tools\msys64",
+        (Join-Path $env:USERPROFILE "scoop\apps\msys2\current"),
+        (Join-Path $env:LOCALAPPDATA "msys64"),
+        (Join-Path $projectRoot ".msys64")
+    )
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if ($candidate -and (Test-Msys2Installation -Root $candidate)) {
+            $script:MsysRoot = $candidate
+            return $true
+        }
+    }
+    return $false
+}
+
+# bootstrap 找不到 MSYS2 時的自動安裝：下載官方自解壓安裝包，
+# 解壓後執行首次啟動初始化（keyring、套件資料庫），並把 $MsysRoot 指向新安裝位置。
+# 自解壓包固定解出 msys64\ 目錄，因此目標根目錄僅支援以 msys64 結尾的路徑；
+# 指定的父目錄無法建立時，改裝到 %LOCALAPPDATA%\msys64。
+function Install-Msys2 {
+    $installerArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
+    $downloadPath = Join-Path ([IO.Path]::GetTempPath()) "msys2-base-$installerArch-latest.sfx.exe"
+    $installRoot = $null
+    $extractDir = $null
+    if ((Split-Path $MsysRoot -Leaf) -ieq "msys64") {
+        $extractDir = Split-Path $MsysRoot -Parent
+        try {
+            New-Item -ItemType Directory -Force -Path $extractDir -ErrorAction Stop | Out-Null
+            $installRoot = $MsysRoot
+        }
+        catch {
+            Write-Warning "Cannot create '$extractDir'; falling back to $env:LOCALAPPDATA\msys64."
+        }
+    }
+    if (-not $installRoot) {
+        $extractDir = $env:LOCALAPPDATA
+        $installRoot = Join-Path $extractDir "msys64"
+    }
+    if ((Test-Path -LiteralPath $installRoot) -and (Get-ChildItem -LiteralPath $installRoot -Force)) {
+        throw "MSYS2 install target '$installRoot' already exists and is not empty."
+    }
+    $url = "https://github.com/msys2/msys2-installer/releases/download/nightly-$installerArch/msys2-base-$installerArch-latest.sfx.exe"
+    Write-Host "Downloading MSYS2 ($installerArch) from $url ..."
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+    catch { }
+    $previousProgress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $downloadPath -UseBasicParsing
+        Unblock-File -LiteralPath $downloadPath
+    }
+    finally {
+        $ProgressPreference = $previousProgress
+    }
+    Write-Host "Extracting MSYS2 to $installRoot (this can take a few minutes)..."
+    Invoke-Native -FilePath $downloadPath -Arguments @("-y", "-o$extractDir")
+    $bash = Join-Path $installRoot "usr\bin\bash.exe"
+    Write-Host "Initializing MSYS2 (first run, keyring, package database)..."
+    Invoke-Native -FilePath $bash -Arguments @("-lc", "true")
+    Invoke-Native -FilePath $bash -Arguments @("-lc", "pacman-key --init")
+    Invoke-Native -FilePath $bash -Arguments @("-lc", "pacman-key --populate msys2")
+    Invoke-Native -FilePath $bash -Arguments @("-lc", "pacman -Sy --noconfirm")
+    $script:MsysRoot = $installRoot
+}
+
+$requestedMsysRoot = $MsysRoot
+if ((Resolve-Msys2Installation) -and $MsysRoot -ne $requestedMsysRoot) {
+    Write-Host "Using MSYS2 found at $MsysRoot (override with -MsysRoot or MSYS2_ROOT)."
+}
 $prefix = Join-Path $MsysRoot $environmentName
 $runtimeBin = Join-Path $prefix "bin"
 $outDir = Join-Path $projectRoot "out\$Architecture"
@@ -84,8 +168,9 @@ function Assert-Msys2 {
     $pacman = Join-Path $MsysRoot "usr\bin\pacman.exe"
     if (-not (Test-Path -LiteralPath $pacman)) {
         throw (
-            "MSYS2 was not found at $MsysRoot. " +
-            "Install MSYS2 from https://www.msys2.org/ or pass -MsysRoot."
+            "MSYS2 was not found (checked -MsysRoot '$MsysRoot' and common install locations). " +
+            "Run '.\build.ps1 bootstrap -Architecture $Architecture' to install MSYS2 automatically, " +
+            "or install it from https://www.msys2.org/ and pass -MsysRoot / set MSYS2_ROOT."
         )
     }
 }
@@ -205,6 +290,10 @@ function Assert-BeaconPythonPackages {
 }
 
 function Install-Dependencies {
+    if (-not (Resolve-Msys2Installation)) {
+        Install-Msys2
+    }
+    Write-Host "Using MSYS2 at $MsysRoot"
     $beaconPython = Get-BeaconPython
     Set-BuildEnvironment
     $pacman = Join-Path $MsysRoot "usr\bin\pacman.exe"
